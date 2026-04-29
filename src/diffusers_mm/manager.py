@@ -79,10 +79,23 @@ class ModelManager:
     # Block-pin auto-budget: when computing the optimal ``num_to_pin`` per
     # component, reserve this much VRAM for the streaming overflow's
     # working set (pinned host buffers in flight + activations + per-step
-    # peaks). Empirically ~5 GiB on LTX-2.3 at 768x512x121f; round to 6
-    # for safety. Override per-component via ``set_block_pin_count`` if
-    # this heuristic is wrong for your workload.
-    AUTO_BLOCK_PIN_WORKING_SET_GB = 6.0
+    # peaks).
+    #
+    # Empirically calibrated for image-diffusion workloads. **For long
+    # video at meaningful resolution (e.g. LTX-2.3 at 768×512×121f) the
+    # actual working set is 10–14 GiB**, far above this constant — the
+    # auto-budget will over-pin on small GPUs and overflow. Bump this on
+    # the instance/subclass for those workloads, or override the per-
+    # component pin count via :meth:`set_block_pin_count`.
+    #
+    # Measured on LTX-2.3 distilled int4 (per-block 0.223 GiB,
+    # non-block 0.71 GiB, 48 blocks) at 768×512×121f, 8 steps:
+    #   - Linux RTX 5090 32 GiB:    WS ≈ 10.3 GiB (n=28) → 12.2 GiB (n=0)
+    #   - Windows RTX 4090L 16 GiB: WS ≈ 13.1 GiB (n=28) → 14.3 GiB (n=0)
+    # Working set scales with the number of streamed (non-pinned) blocks;
+    # the constant cannot capture that, so we pick a conservative value
+    # that's safe for image diffusion and document the video gap.
+    AUTO_BLOCK_PIN_WORKING_SET_GB = 6.5
     # Don't bother with block_pin if the discoverable block list is
     # smaller than this — the overhead of per-block apply_group_offloading
     # outweighs the benefit when there are only a handful of blocks.
@@ -756,8 +769,11 @@ class ModelManager:
 
         If the user has set an override via ``set_block_pin_count``, that
         wins (clamped to ``[0, len(blocks)]``). Otherwise: take available
-        VRAM, subtract the component's non-block size and a working-set
-        safety margin, divide by per-block size.
+        VRAM, subtract the component's non-block size, the working-set
+        safety margin, and one per-block worth of VRAM for the streamed-
+        in-flight block (``apply_group_offloading(use_stream=True)`` keeps
+        the next overflow block prefetched on GPU while the current one
+        computes). Divide by per-block size.
         """
         with self._lock:
             override = self._block_pin_counts.get(component_name)
@@ -772,15 +788,16 @@ class ModelManager:
         vram_avail_gb, _ = self._detect_available_vram_gb(device)
         non_block_gb = non_block_size_bytes(component, block_attr) / (1024**3)
 
-        budget_gb = vram_avail_gb - non_block_gb - self.AUTO_BLOCK_PIN_WORKING_SET_GB
+        budget_gb = vram_avail_gb - non_block_gb - self.AUTO_BLOCK_PIN_WORKING_SET_GB - per_block_gb
         if budget_gb <= 0:
             logger.warning(
                 "block_pin: %s — no VRAM budget for pinning (avail=%.1f, non_block=%.1f, "
-                "working_set=%.1f) → 0 pinned, all blocks stream",
+                "working_set=%.1f, streamed_in_flight=%.2f) → 0 pinned, all blocks stream",
                 component_name,
                 vram_avail_gb,
                 non_block_gb,
                 self.AUTO_BLOCK_PIN_WORKING_SET_GB,
+                per_block_gb,
             )
             return 0
 

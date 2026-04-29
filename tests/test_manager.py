@@ -1177,8 +1177,8 @@ class TestBlockPinCount:
             mm.set_block_pin_count("transformer", -1)
 
     def test_auto_count_uses_vram_budget(self, monkeypatch):
-        # 12 GB VRAM, 0.5 GB non-block, 6 GB working set = 5.5 GB budget.
-        # Per-block size = 1 GB → 5 blocks fit.
+        # 12 GB VRAM, 0.5 GB non-block, 6.5 GB working set, 1 GB streamed
+        # in flight = 4.0 GB budget. Per-block size = 1 GB → 4 blocks fit.
         _patch_vram(monkeypatch, 12.0)
         mm = ModelManager()
         # Stub the size helpers — actually allocating GB of params is not
@@ -1188,10 +1188,10 @@ class TestBlockPinCount:
         m = nn.Module()
         m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(20)])
         n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
-        assert n == 5
+        assert n == 4
 
     def test_auto_count_returns_zero_when_no_budget(self, monkeypatch, caplog):
-        # 6 GB VRAM, 6 GB non-block → budget = 6 - 6 - 6 = -6 → 0 pinned.
+        # 6 GB VRAM, 6 GB non-block → budget = 6 - 6 - 6.5 - 1 = -7.5 → 0 pinned.
         _patch_vram(monkeypatch, 6.0)
         mm = ModelManager()
         monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(1.0 * 1024**3))
