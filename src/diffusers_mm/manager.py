@@ -20,7 +20,7 @@ from diffusers_mm.hooks import remove_offload_hooks
 
 logger = logging.getLogger(__name__)
 
-OFFLOAD_STRATEGIES = ("auto", "no_offload", "model_offload", "sequential_group_offload", "group_offload")
+OFFLOAD_STRATEGIES = ("auto", "no_offload", "model_offload", "group_offload")
 
 _SCOPED_DEVICE: contextvars.ContextVar[torch.device | None] = contextvars.ContextVar(
     "diffusers_mm_scoped_device", default=None
@@ -50,8 +50,9 @@ class ModelManager:
     def __init__(
         self,
         strategy: str = "auto",
-        group_offload_use_stream: bool = False,
-        group_offload_low_cpu_mem: bool = False,
+        group_offload_use_stream: bool = True,
+        group_offload_low_cpu_mem: bool = True,
+        group_offload_record_stream: bool = False,
     ) -> None:
         self._lock = threading.RLock()
         self._component_cache: dict[str, Any] = {}
@@ -82,12 +83,19 @@ class ModelManager:
         # unregister_components. Dict sources aren't weakref-able, so the
         # entry may be missing for those.
         self._source_finalizers: dict[int, weakref.finalize] = {}
+        # When model_offload installs accelerate's chained
+        # ``cpu_offload_with_hook``, the last hook in the chain is kept here.
+        # It can be used to manually offload the trailing component (the one
+        # that stays on GPU after the chain's final forward) — diffusers
+        # exposes this on the pipeline as ``final_offload_hook``.
+        self._model_offload_final_hook: Any = None
         self._applied_strategy: str | None = None
 
         self._offload_strategy: str = "auto"
         self.offload_strategy = strategy  # validate through setter
-        self._group_offload_use_stream: bool = group_offload_use_stream
-        self._group_offload_low_cpu_mem: bool = group_offload_low_cpu_mem
+        self._group_offload_use_stream: bool = bool(group_offload_use_stream)
+        self._group_offload_low_cpu_mem: bool = bool(group_offload_low_cpu_mem)
+        self._group_offload_record_stream: bool = bool(group_offload_record_stream)
 
     # ------------------------------------------------------------------
     # Strategy properties
@@ -124,6 +132,16 @@ class ModelManager:
     def group_offload_low_cpu_mem(self, value: bool) -> None:
         with self._lock:
             self._group_offload_low_cpu_mem = bool(value)
+
+    @property
+    def group_offload_record_stream(self) -> bool:
+        with self._lock:
+            return self._group_offload_record_stream
+
+    @group_offload_record_stream.setter
+    def group_offload_record_stream(self, value: bool) -> None:
+        with self._lock:
+            self._group_offload_record_stream = bool(value)
 
     @property
     def applied_strategy(self) -> str | None:
@@ -495,8 +513,6 @@ class ModelManager:
             return "no_offload"
         if total_gb >= 12:
             return "model_offload"
-        if total_gb >= 8:
-            return "sequential_group_offload"
         return "group_offload"
 
     def prepare_strategy_transition(self, new_strategy: str, device: torch.device | str) -> None:
@@ -506,28 +522,33 @@ class ModelManager:
         names (the same module registered under multiple names) only get
         cleaned up once. Clears per-component strategy state so every
         component will be re-applied under the new strategy.
+
+        Hook-based strategies (``group_offload`` via diffusers hooks,
+        ``model_offload`` via accelerate hooks) all have their hooks
+        stripped via ``remove_offload_hooks`` (which handles both flavors).
+        Then every component is moved back to CPU so the next strategy
+        starts from a clean state.
         """
         with self._lock:
             old = self._applied_strategy
             if old == new_strategy:
                 return
 
+            hook_based = old in ("group_offload", "model_offload")
+
             seen_ids: set[int] = set()
             for name, mod in self._managed_components.items():
                 if id(mod) in seen_ids:
                     continue
                 seen_ids.add(id(mod))
-                if old in ("group_offload", "sequential_group_offload"):
+                if hook_based:
                     remove_offload_hooks(mod)
-                    if hasattr(mod, "to"):
-                        mod.to("cpu")
-                    logger.debug("Removed offload hooks from %s, moved to CPU", name)
-                elif old in ("no_offload", "model_offload"):
-                    if hasattr(mod, "to"):
-                        mod.to("cpu")
-                        logger.debug("Moved %s to CPU (leaving %s)", name, old)
+                if hasattr(mod, "to"):
+                    mod.to("cpu")
+                    logger.debug("Strategy transition: cleaned %s (was %s)", name, old)
 
             self._component_strategies.clear()
+            self._model_offload_final_hook = None
             self._applied_strategy = new_strategy
 
         gc.collect()
@@ -535,13 +556,29 @@ class ModelManager:
             torch.cuda.empty_cache()
 
     def _group_offload_kwargs(self, device: torch.device | str) -> dict[str, Any]:
-        """Build kwargs for ``apply_group_offloading``."""
+        """Build kwargs for ``apply_group_offloading`` (leaf-level only).
+
+        Configurable knobs come from instance state, settable via the
+        constructor or matching properties:
+
+        - ``group_offload_use_stream`` — overlap transfers with compute
+          (default True; ~1.5–3× faster on hardware that supports streams).
+        - ``group_offload_low_cpu_mem`` — defer pinned host buffer
+          allocation to per-transfer; without this, ``apply_group_offloading``
+          pins a full copy of every weight upfront and holds it for the
+          whole inference (~2× host RAM). Only honored when
+          ``use_stream=True``. Default True.
+        - ``group_offload_record_stream`` — pass-through to
+          ``apply_group_offloading``'s ``record_stream`` parameter.
+          Default False.
+        """
         use_stream = self._group_offload_use_stream
         kwargs: dict[str, Any] = {
             "onload_device": torch.device(device) if isinstance(device, str) else device,
             "offload_device": torch.device("cpu"),
             "offload_type": "leaf_level",
             "use_stream": use_stream,
+            "record_stream": self._group_offload_record_stream,
         }
         if use_stream and self._group_offload_low_cpu_mem:
             kwargs["low_cpu_mem_usage"] = True
@@ -610,18 +647,12 @@ class ModelManager:
                 try:
                     remove_offload_hooks(mod)
                     apply_group_offloading(mod, **offload_kwargs)
-                    logger.info("Group offload enabled for %s", name)
+                    logger.info("group_offload (leaf_level) enabled for %s", name)
                 except Exception as e:
-                    logger.warning("Failed to enable group offload for %s: %s", name, e)
-
-        elif strategy == "sequential_group_offload":
-            for name, mod in unique:
-                if hasattr(mod, "to"):
-                    mod.to("cpu")
-            logger.info("sequential_group_offload: %d component(s) on CPU, hooks deferred", len(unique))
+                    logger.warning("Failed to enable group_offload for %s: %s", name, e)
 
         elif strategy == "model_offload":
-            logger.info("model_offload: %d component(s) remain on CPU", len(unique))
+            self._install_model_offload_chain(device)
 
         with self._lock:
             for name, _ in unique:
@@ -630,6 +661,49 @@ class ModelManager:
                 self._component_strategies[name] = strategy
 
         return strategy
+
+    def _install_model_offload_chain(self, device: torch.device | str) -> None:
+        """Install accelerate ``cpu_offload_with_hook`` chained across all managed components.
+
+        Replaces the previous "do nothing at apply time, defer to use_components"
+        behavior with a real drop-in replacement for diffusers'
+        ``enable_model_cpu_offload``: each component auto-moves to GPU at its
+        own forward call, and the chained ``prev_module_hook`` ensures the
+        previous component is offloaded before the next one loads — which
+        is what keeps the transformer resident on GPU across multi-step
+        denoising loops without thrashing.
+
+        Always processes ALL managed components (not just pending ones)
+        because the chain order has to be consistent with registration
+        order; existing accelerate hooks on those components are removed
+        first so re-applying is safe.
+        """
+        from accelerate import cpu_offload_with_hook
+
+        device_obj = torch.device(device) if isinstance(device, str) else device
+
+        with self._lock:
+            chain_components: list[tuple[str, Any]] = []
+            seen_ids: set[int] = set()
+            for name, mod in self._managed_components.items():
+                if id(mod) in seen_ids:
+                    continue
+                seen_ids.add(id(mod))
+                chain_components.append((name, mod))
+
+        # Strip any prior hooks (idempotent no-op if there are none).
+        for _, mod in chain_components:
+            remove_offload_hooks(mod)
+
+        prev_hook = None
+        for name, mod in chain_components:
+            try:
+                _, prev_hook = cpu_offload_with_hook(mod, device_obj, prev_module_hook=prev_hook)
+                logger.info("model_offload: chained accelerate hook on %s", name)
+            except Exception as e:
+                logger.warning("Failed to install model_offload hook on %s: %s", name, e)
+
+        self._model_offload_final_hook = prev_hook
 
     def reapply_group_offload(self, component_name: str, device: torch.device | str) -> None:
         """Re-apply group offload hooks to a single component.
@@ -667,14 +741,16 @@ class ModelManager:
 
         Behaviour depends on the active offload strategy:
 
-        - ``no_offload`` / ``group_offload``: no-op yield.
-        - ``model_offload``: bulk CPU <-> GPU move.
-        - ``sequential_group_offload``: apply group-offload hooks on enter,
-          remove hooks + move to CPU on exit.
+        - ``no_offload`` / ``group_offload``: no-op yield (placement is
+          already correct — components are on GPU permanently for
+          no_offload, or have hooks for group_offload).
+        - ``model_offload``: bulk CPU → GPU move on enter, back to CPU on
+          exit. Mostly relevant for **decomposed** pipeline workflows;
+          monolithic ``pipe(...)`` calls already work correctly under
+          model_offload via the accelerate chain installed at apply time.
 
-        *strategy_override* lets callers force a different strategy for these
-        components (e.g. ``"model_offload"`` for small models like VAE that
-        are too granular for leaf-level hook offloading).
+        *strategy_override* lets callers force a different strategy for
+        these components for the duration of the block.
         """
         strategy = self._applied_strategy
         if strategy is None:
@@ -717,27 +793,6 @@ class ModelManager:
                             logger.debug("model_offload: restored group_offload hooks on %s", name)
                         except Exception as e:
                             logger.warning("model_offload: failed to restore hooks on %s: %s", name, e)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-        elif strategy == "sequential_group_offload":
-            from diffusers.hooks.group_offloading import apply_group_offloading
-
-            offload_kwargs = self._group_offload_kwargs(device)
-            for name, mod in modules:
-                try:
-                    apply_group_offloading(mod, **offload_kwargs)
-                    logger.debug("sequential_group_offload: hooks applied to %s", name)
-                except Exception as e:
-                    logger.warning("sequential_group_offload: failed to hook %s: %s", name, e)
-            try:
-                yield
-            finally:
-                for name, mod in modules:
-                    remove_offload_hooks(mod)
-                    if hasattr(mod, "to"):
-                        mod.to("cpu")
-                    logger.debug("sequential_group_offload: cleaned up %s", name)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -819,9 +874,11 @@ class ModelManager:
             self._component_strategies.clear()
             self._refcount.clear()
             self._source_registrations.clear()
+            self._model_offload_final_hook = None
             self._applied_strategy = None
-            self._group_offload_use_stream = False
-            self._group_offload_low_cpu_mem = False
+            self._group_offload_use_stream = True
+            self._group_offload_low_cpu_mem = True
+            self._group_offload_record_stream = False
         gc.collect()
         if torch.cuda.is_available():
             try:

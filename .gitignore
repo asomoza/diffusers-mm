@@ -39,3 +39,6 @@ uv.lock
 
 # Claude / local tooling
 .claude/
+
+# local tests demo scripts
+/demo_scripts/

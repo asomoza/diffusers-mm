@@ -14,15 +14,23 @@ from diffusers_mm.manager import ModelManager
 logger = logging.getLogger(__name__)
 
 
+# Sentinel for "user didn't pass this kwarg" — distinguishes "I passed the
+# default value explicitly" from "I didn't pass anything." Used so that
+# managed() can warn if the caller mixes ``mm=`` with configuration kwargs,
+# without false-positiving when those kwargs equal their defaults.
+_UNSET: Any = object()
+
+
 def managed(
     pipe: Any,
     *,
     mm: ModelManager | None = None,
-    strategy: str = "auto",
+    strategy: str = _UNSET,
     device: torch.device | str = "cuda",
     dtype: torch.dtype | None = None,
-    group_offload_use_stream: bool = False,
-    group_offload_low_cpu_mem: bool = False,
+    group_offload_use_stream: bool = _UNSET,
+    group_offload_low_cpu_mem: bool = _UNSET,
+    group_offload_record_stream: bool = _UNSET,
 ) -> Any:
     """Wrap a diffusers pipeline with smart model management.
 
@@ -56,13 +64,19 @@ def managed(
             are ignored — the manager owns its own configuration.
         strategy: Offload strategy when *mm* is not provided. One of
             ``"auto"``, ``"no_offload"``, ``"model_offload"``,
-            ``"sequential_group_offload"``, ``"group_offload"``.
+            ``"group_offload"``. Default ``"auto"``.
         device: Target device for inference.
         dtype: Optional dtype override for device scoping.
         group_offload_use_stream: Use CUDA streams for group offload
-            transfers (only honoured when *mm* is not provided).
-        group_offload_low_cpu_mem: Low CPU memory mode, only effective
-            with streams (only honoured when *mm* is not provided).
+            transfers — overlaps transfers with compute (~1.5–3× faster
+            on hardware that supports it). Default True.
+        group_offload_low_cpu_mem: Low CPU memory mode for group offload —
+            avoids pinning a full copy of every weight upfront (which
+            would ~double host RAM). Only honored when ``use_stream=True``.
+            Default True.
+        group_offload_record_stream: Pass-through to
+            ``apply_group_offloading``'s ``record_stream`` parameter.
+            Default False.
 
     Returns:
         The same pipeline object, augmented with a ``.mm`` attribute and
@@ -72,25 +86,37 @@ def managed(
         device = torch.device(device)
 
     if mm is None:
-        mm = ModelManager(
-            strategy=strategy,
-            group_offload_use_stream=group_offload_use_stream,
-            group_offload_low_cpu_mem=group_offload_low_cpu_mem,
-        )
-    elif strategy != "auto" or group_offload_use_stream or group_offload_low_cpu_mem:
-        # Likely-confused caller: passing both an existing manager AND
-        # configuration kwargs. The kwargs are ignored — surface the
-        # mismatch instead of silently dropping the intent.
-        logger.warning(
-            "managed(): an existing ModelManager was supplied along with "
-            "configuration kwargs (strategy=%r, group_offload_use_stream=%s, "
-            "group_offload_low_cpu_mem=%s). These are ignored — the manager's "
-            "existing configuration is used. Configure the manager directly "
-            "if you want to change them.",
-            strategy,
-            group_offload_use_stream,
-            group_offload_low_cpu_mem,
-        )
+        # Build kwargs only for explicitly-passed values so ModelManager's
+        # own defaults govern unset ones.
+        mm_kwargs: dict[str, Any] = {}
+        if strategy is not _UNSET:
+            mm_kwargs["strategy"] = strategy
+        if group_offload_use_stream is not _UNSET:
+            mm_kwargs["group_offload_use_stream"] = group_offload_use_stream
+        if group_offload_low_cpu_mem is not _UNSET:
+            mm_kwargs["group_offload_low_cpu_mem"] = group_offload_low_cpu_mem
+        if group_offload_record_stream is not _UNSET:
+            mm_kwargs["group_offload_record_stream"] = group_offload_record_stream
+        mm = ModelManager(**mm_kwargs)
+    else:
+        # Detect a likely-confused caller: passing both an existing manager
+        # AND configuration kwargs. The kwargs would be ignored, so surface
+        # the mismatch instead of silently dropping intent.
+        passed = {
+            "strategy": strategy,
+            "group_offload_use_stream": group_offload_use_stream,
+            "group_offload_low_cpu_mem": group_offload_low_cpu_mem,
+            "group_offload_record_stream": group_offload_record_stream,
+        }
+        explicit = {k: v for k, v in passed.items() if v is not _UNSET}
+        if explicit:
+            logger.warning(
+                "managed(): an existing ModelManager was supplied along with "
+                "configuration kwargs %s. These are ignored — the manager's "
+                "existing configuration is used. Configure the manager directly "
+                "if you want to change them.",
+                explicit,
+            )
 
     if not hasattr(pipe, "components") or not isinstance(pipe.components, dict):
         raise TypeError(

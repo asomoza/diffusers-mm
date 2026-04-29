@@ -31,10 +31,49 @@ class TestModelManagerInit:
         with pytest.raises(ValueError, match="Unknown offload strategy"):
             ModelManager(strategy="bogus")
 
-    def test_group_offload_options(self):
-        mm = ModelManager(group_offload_use_stream=True, group_offload_low_cpu_mem=True)
+    def test_group_offload_default_options(self):
+        # Defaults: use_stream + low_cpu_mem ON, record_stream OFF. These
+        # match the "fast, RAM-conservative" leaf-level group offload that
+        # diffusers itself recommends — and avoid the 2× host-RAM trap of
+        # use_stream=True without low_cpu_mem_usage.
+        mm = ModelManager()
         assert mm.group_offload_use_stream is True
         assert mm.group_offload_low_cpu_mem is True
+        assert mm.group_offload_record_stream is False
+
+    def test_group_offload_options_overrides(self):
+        mm = ModelManager(
+            group_offload_use_stream=False,
+            group_offload_low_cpu_mem=False,
+            group_offload_record_stream=True,
+        )
+        assert mm.group_offload_use_stream is False
+        assert mm.group_offload_low_cpu_mem is False
+        assert mm.group_offload_record_stream is True
+
+
+class TestGroupOffloadKwargs:
+    """Validate the kwargs builder's output for each setting combination."""
+
+    def test_leaf_level_with_defaults(self):
+        mm = ModelManager()
+        kwargs = mm._group_offload_kwargs("cpu")
+        assert kwargs["offload_type"] == "leaf_level"
+        assert kwargs["use_stream"] is True
+        assert kwargs["record_stream"] is False
+        assert kwargs["low_cpu_mem_usage"] is True  # gated on use_stream
+
+    def test_low_cpu_mem_dropped_when_streams_off(self):
+        mm = ModelManager(group_offload_use_stream=False, group_offload_low_cpu_mem=True)
+        kwargs = mm._group_offload_kwargs("cpu")
+        assert kwargs["use_stream"] is False
+        # low_cpu_mem is documented as only honoured when use_stream=True.
+        assert "low_cpu_mem_usage" not in kwargs
+
+    def test_record_stream_passed_through(self):
+        mm = ModelManager(group_offload_record_stream=True)
+        kwargs = mm._group_offload_kwargs("cpu")
+        assert kwargs["record_stream"] is True
 
 
 class TestComponentRegistration:
@@ -808,7 +847,14 @@ class TestUseComponentsModelOffload:
 
 class TestClear:
     def test_clears_everything(self):
-        mm = ModelManager(group_offload_use_stream=True, group_offload_low_cpu_mem=True)
+        # Override the defaults to non-default values to verify clear()
+        # resets back to the documented defaults (use_stream=True,
+        # low_cpu_mem=True, record_stream=False).
+        mm = ModelManager(
+            group_offload_use_stream=False,
+            group_offload_low_cpu_mem=False,
+            group_offload_record_stream=True,
+        )
         mm.register_component("model", DummyModel())
         mm.set_cached("key", "value")
         mm._applied_strategy = "no_offload"
@@ -818,8 +864,9 @@ class TestClear:
         assert mm.get_component("model") is None
         assert mm.get_cached("key") is None
         assert mm.applied_strategy is None
-        assert mm.group_offload_use_stream is False
-        assert mm.group_offload_low_cpu_mem is False
+        assert mm.group_offload_use_stream is True
+        assert mm.group_offload_low_cpu_mem is True
+        assert mm.group_offload_record_stream is False
         assert mm.component_names == []
 
 
