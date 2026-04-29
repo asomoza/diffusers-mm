@@ -164,6 +164,79 @@ class TestDisplacedModuleHookCleanup:
         assert old not in cleaned
 
 
+class TestUnregisterComponent:
+    def test_returns_true_when_present(self):
+        mm = ModelManager()
+        mm.register_component("model", DummyModel())
+        assert mm.unregister_component("model") is True
+        assert mm.get_component("model") is None
+        assert mm.component_names == []
+
+    def test_returns_false_when_missing(self):
+        mm = ModelManager()
+        assert mm.unregister_component("nonexistent") is False
+
+    def test_drops_per_component_strategy_state(self):
+        mm = ModelManager(strategy="no_offload")
+        mm.register_component("model", DummyModel())
+        mm.apply_offload_strategy("cpu")
+        assert mm._component_strategies["model"] == "no_offload"
+        mm.unregister_component("model")
+        assert "model" not in mm._component_strategies
+
+    def test_leaves_global_applied_strategy_untouched(self):
+        # Other components keep their state; the manager's global strategy
+        # remains so future applies don't trigger transitions.
+        mm = ModelManager(strategy="no_offload")
+        mm.register_component("a", DummyModel())
+        mm.register_component("b", DummyModel())
+        mm.apply_offload_strategy("cpu")
+
+        mm.unregister_component("a")
+        assert mm.applied_strategy == "no_offload"
+        assert mm._component_strategies == {"b": "no_offload"}
+
+    def test_cleans_hooks_for_hooked_strategy(self, monkeypatch):
+        cleaned: list = []
+        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
+
+        mm = ModelManager(strategy="group_offload")
+        m = DummyModel()
+        mm.register_component("transformer", m)
+        # Simulate post-apply state without going through real diffusers hooks.
+        mm._component_strategies["transformer"] = "group_offload"
+
+        mm.unregister_component("transformer")
+        assert cleaned == [m]
+
+    def test_skips_cleanup_for_aliased_module(self, monkeypatch):
+        cleaned: list = []
+        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
+
+        mm = ModelManager(strategy="group_offload")
+        shared = DummyModel()
+        mm.register_component("primary", shared)
+        mm.register_component("alias", shared)
+        mm._component_strategies = {"primary": "group_offload", "alias": "group_offload"}
+
+        mm.unregister_component("primary")
+        # The alias still exposes the module — its hooks are still meaningful.
+        assert shared not in cleaned
+        assert mm.get_component("alias") is shared
+
+    def test_skips_cleanup_for_non_hook_strategy(self, monkeypatch):
+        cleaned: list = []
+        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
+
+        mm = ModelManager(strategy="no_offload")
+        m = DummyModel()
+        mm.register_component("model", m)
+        mm.apply_offload_strategy("cpu")
+
+        mm.unregister_component("model")
+        assert m not in cleaned
+
+
 class TestRegisterComponents:
     def test_from_dict(self):
         mm = ModelManager()

@@ -113,6 +113,30 @@ class ModelManager:
     # Component registration
     # ------------------------------------------------------------------
 
+    def _cleanup_orphan_hooks(self, name: str, module: Any, action: str) -> None:
+        """Remove hook-based offload state from *module* if it's about to be orphaned.
+
+        Caller must hold ``self._lock``. Acts only when the slot's prior
+        strategy was ``group_offload`` / ``sequential_group_offload`` *and*
+        *module* is no longer reachable under any other name in the
+        registry. *action* is just for the log line ("displaced" /
+        "unregistered").
+        """
+        old_strategy = self._component_strategies.get(name)
+        if old_strategy not in ("group_offload", "sequential_group_offload"):
+            return
+        still_aliased = any(
+            other_name != name and other_module is module
+            for other_name, other_module in self._managed_components.items()
+        )
+        if still_aliased:
+            return
+        try:
+            remove_offload_hooks(module)
+            logger.info("Cleaned offload hooks on %s module %r (was %s)", action, name, old_strategy)
+        except Exception as e:
+            logger.warning("Failed to clean hooks on %s %r: %s", action, name, e)
+
     def register_component(self, name: str, module: Any) -> None:
         """Register a named nn.Module component for lifecycle management.
 
@@ -138,27 +162,30 @@ class ModelManager:
             existing = self._managed_components.get(name)
             if existing is module:
                 return
-
             if existing is not None:
-                old_strategy = self._component_strategies.get(name)
-                if old_strategy in ("group_offload", "sequential_group_offload"):
-                    still_aliased = any(
-                        other_name != name and other_module is existing
-                        for other_name, other_module in self._managed_components.items()
-                    )
-                    if not still_aliased:
-                        try:
-                            remove_offload_hooks(existing)
-                            logger.info(
-                                "Cleaned offload hooks on displaced module under name %r (was %s)",
-                                name,
-                                old_strategy,
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to clean hooks on displaced module under %r: %s", name, e)
-
+                self._cleanup_orphan_hooks(name, existing, "displaced")
             self._managed_components[name] = module
             self._component_strategies.pop(name, None)
+
+    def unregister_component(self, name: str) -> bool:
+        """Remove *name* from the registry.
+
+        Same orphan-cleanup semantics as ``register_component``: if the
+        module had hook-based offloading applied (``group_offload`` /
+        ``sequential_group_offload``) and isn't aliased under another name,
+        its hooks are removed before the reference is dropped.
+
+        Returns ``True`` if a component was removed, ``False`` if no
+        component was registered under *name*.
+        """
+        with self._lock:
+            existing = self._managed_components.get(name)
+            if existing is None:
+                return False
+            self._cleanup_orphan_hooks(name, existing, "unregistered")
+            del self._managed_components[name]
+            self._component_strategies.pop(name, None)
+            return True
 
     def register_components(self, source: Any) -> list[str]:
         """Register every ``nn.Module`` exposed by *source*.
