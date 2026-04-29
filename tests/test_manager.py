@@ -381,6 +381,114 @@ class TestRegisterComponentsSource:
         assert mm.get_component("transformer") is None
 
 
+class TestSourceWeakrefCleanup:
+    """When a source object is GC'd, its components should auto-unregister
+    so the user doesn't leak modules by forgetting unregister_components."""
+
+    def _make_pipe(self, **comps):
+        class FakePipe:
+            pass
+
+        p = FakePipe()
+        p.components = comps
+        return p
+
+    def test_gc_of_source_releases_unique_modules(self):
+        import gc as _gc
+
+        mm = ModelManager()
+        m = DummyModel()
+        pipe = self._make_pipe(transformer=m)
+        mm.register_components(pipe)
+        assert mm._refcount[id(m)] == 1
+
+        # Drop the only strong reference to pipe and force GC.
+        del pipe
+        _gc.collect()
+
+        # The finalizer fired → record removed, refcount decremented to 0,
+        # module fully cleaned up.
+        assert mm._refcount == {}
+        assert mm.get_component("transformer") is None
+        assert mm._source_registrations == {}
+        assert mm._source_finalizers == {}
+
+    def test_gc_of_one_source_keeps_shared_module_alive(self):
+        import gc as _gc
+
+        mm = ModelManager()
+        shared = DummyModel()
+        pipe1 = self._make_pipe(text_encoder=shared)
+        pipe2 = self._make_pipe(text_encoder=shared)
+        mm.register_components(pipe1)
+        mm.register_components(pipe2)
+        assert mm._refcount[id(shared)] == 2
+
+        # GC pipe1 only — pipe2 still keeps shared alive.
+        del pipe1
+        _gc.collect()
+
+        assert mm.get_component("text_encoder") is shared
+        assert mm._refcount[id(shared)] == 1
+
+    def test_explicit_unregister_detaches_finalizer(self):
+        # After explicit unregister_components, GCing the source must NOT
+        # try to clean up again — the finalizer should have been detached.
+        import gc as _gc
+
+        mm = ModelManager()
+        m = DummyModel()
+        pipe = self._make_pipe(transformer=m)
+        mm.register_components(pipe)
+        mm.unregister_components(pipe)
+
+        # Re-register a different module under the same name to set up
+        # detection: if the (detached) finalizer fired, it would try to
+        # touch state and we'd notice.
+        m2 = DummyModel()
+        pipe2 = self._make_pipe(transformer=m2)
+        mm.register_components(pipe2)
+        assert mm._refcount[id(m2)] == 1
+
+        del pipe
+        _gc.collect()
+
+        # pipe's finalizer was detached at unregister, so this GC is a no-op.
+        assert mm._refcount[id(m2)] == 1
+        assert mm.get_component("transformer") is m2
+
+    def test_clear_detaches_finalizers(self):
+        import gc as _gc
+
+        mm = ModelManager()
+        pipe = self._make_pipe(transformer=DummyModel())
+        mm.register_components(pipe)
+        assert mm._source_finalizers != {}
+
+        mm.clear()
+        # Finalizers detached as part of clear.
+        assert mm._source_finalizers == {}
+
+        # GCing the source post-clear is a no-op (no callback to fire).
+        del pipe
+        _gc.collect()
+        assert mm._source_registrations == {}
+
+    def test_dict_source_skips_finalizer_silently(self):
+        # Dicts can't be weakref'd. register_components should still work
+        # — just no auto-cleanup.
+        mm = ModelManager()
+        m = DummyModel()
+        d = {"transformer": m}
+        mm.register_components(d)
+        assert mm.get_component("transformer") is m
+        # No finalizer registered for dict source.
+        assert id(d) not in mm._source_finalizers
+        # Explicit unregister still works.
+        mm.unregister_components(d)
+        assert mm.get_component("transformer") is None
+
+
 class TestUnloadComponent:
     def test_returns_false_when_missing(self):
         mm = ModelManager()

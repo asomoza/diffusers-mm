@@ -77,6 +77,20 @@ def managed(
             group_offload_use_stream=group_offload_use_stream,
             group_offload_low_cpu_mem=group_offload_low_cpu_mem,
         )
+    elif strategy != "auto" or group_offload_use_stream or group_offload_low_cpu_mem:
+        # Likely-confused caller: passing both an existing manager AND
+        # configuration kwargs. The kwargs are ignored — surface the
+        # mismatch instead of silently dropping the intent.
+        logger.warning(
+            "managed(): an existing ModelManager was supplied along with "
+            "configuration kwargs (strategy=%r, group_offload_use_stream=%s, "
+            "group_offload_low_cpu_mem=%s). These are ignored — the manager's "
+            "existing configuration is used. Configure the manager directly "
+            "if you want to change them.",
+            strategy,
+            group_offload_use_stream,
+            group_offload_low_cpu_mem,
+        )
 
     if not hasattr(pipe, "components") or not isinstance(pipe.components, dict):
         raise TypeError(

@@ -8,6 +8,7 @@ import gc
 import hashlib
 import logging
 import threading
+import weakref
 from collections.abc import Callable, Generator
 from typing import Any
 
@@ -74,6 +75,13 @@ class ModelManager:
         # bulk register/unregister also lives here: a second
         # register_components on the same source is a no-op.
         self._source_registrations: dict[int, dict[str, Any]] = {}
+        # weakref.finalize handles per source, keyed by id(source). When a
+        # source object is garbage-collected, its finalizer fires and
+        # auto-unregisters its components — preventing the leak where a
+        # user lets a pipeline go out of scope without calling
+        # unregister_components. Dict sources aren't weakref-able, so the
+        # entry may be missing for those.
+        self._source_finalizers: dict[int, weakref.finalize] = {}
         self._applied_strategy: str | None = None
 
         self._offload_strategy: str = "auto"
@@ -272,7 +280,43 @@ class ModelManager:
                     self.register_component(name, comp)
                     registered[name] = comp
             self._source_registrations[source_id] = registered
+
+            # Auto-cleanup if the source is GC'd before the user calls
+            # unregister_components. Dicts and a few other types can't be
+            # weakref'd — for those we just skip and rely on explicit
+            # unregister.
+            try:
+                self._source_finalizers[source_id] = weakref.finalize(source, self._on_source_gc, source_id)
+            except TypeError:
+                logger.debug(
+                    "register_components: source %s is not weakref-able; "
+                    "auto-cleanup on GC won't fire — caller must call "
+                    "unregister_components explicitly.",
+                    type(source).__name__,
+                )
+
             return list(registered.keys())
+
+    def _on_source_gc(self, source_id: int) -> None:
+        """Finalizer callback fired when a registered source is garbage-collected.
+
+        Performs the same teardown as :meth:`unregister_components` but
+        keyed by id directly (the source object no longer exists). May
+        run in any thread; acquires the lock before touching state.
+        """
+        with self._lock:
+            record = self._source_registrations.pop(source_id, None)
+            self._source_finalizers.pop(source_id, None)
+            if record is None:
+                return
+            cleaned = 0
+            for name, module in record.items():
+                current = self._managed_components.get(name)
+                if current is module:
+                    self.unregister_component(name)
+                    cleaned += 1
+            if cleaned:
+                logger.info("Auto-cleanup: source GC released %d component(s)", cleaned)
 
     def unregister_components(self, source: Any) -> list[str]:
         """Bulk-unregister using the per-source record from
@@ -295,6 +339,12 @@ class ModelManager:
         """
         source_id = id(source)
         with self._lock:
+            # Detach the GC finalizer (if any) so it doesn't fire later
+            # and try to clean up state we just removed.
+            finalizer = self._source_finalizers.pop(source_id, None)
+            if finalizer is not None:
+                finalizer.detach()
+
             record = self._source_registrations.pop(source_id, None)
             if record is None:
                 return []
@@ -759,6 +809,11 @@ class ModelManager:
                     remove_offload_hooks(module)
                 except Exception as e:
                     logger.warning("clear: failed to remove hooks: %s", e)
+            # Detach any active source finalizers so they don't fire
+            # later trying to clean up state we just wiped.
+            for finalizer in self._source_finalizers.values():
+                finalizer.detach()
+            self._source_finalizers.clear()
             self._component_cache.clear()
             self._managed_components.clear()
             self._component_strategies.clear()

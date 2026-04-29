@@ -129,3 +129,20 @@ class TestManagedSharedManager:
         pipe = FakePipeline(transformer=DummyModel())
         managed(pipe, mm=mm, strategy="no_offload", device="cpu")
         assert mm.offload_strategy == "model_offload"
+
+    def test_external_mm_with_config_kwargs_warns(self, caplog):
+        # When the caller passes both mm and non-default configuration
+        # kwargs, log a warning so the silent-ignore doesn't surprise them.
+        mm = ModelManager(strategy="model_offload")
+        pipe = FakePipeline(transformer=DummyModel())
+        with caplog.at_level("WARNING"):
+            managed(pipe, mm=mm, strategy="no_offload", device="cpu")
+        assert any("an existing ModelManager was supplied along with" in rec.message for rec in caplog.records)
+
+    def test_external_mm_without_config_kwargs_does_not_warn(self, caplog):
+        # Default kwargs only → no warning.
+        mm = ModelManager(strategy="model_offload")
+        pipe = FakePipeline(transformer=DummyModel())
+        with caplog.at_level("WARNING"):
+            managed(pipe, mm=mm, device="cpu")
+        assert not any("an existing ModelManager was supplied along with" in rec.message for rec in caplog.records)
