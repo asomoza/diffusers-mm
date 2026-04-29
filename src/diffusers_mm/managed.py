@@ -30,7 +30,6 @@ def managed(
     dtype: torch.dtype | None = None,
     group_offload_use_stream: bool = _UNSET,
     group_offload_low_cpu_mem: bool = _UNSET,
-    group_offload_record_stream: bool = _UNSET,
 ) -> Any:
     """Wrap a diffusers pipeline with smart model management.
 
@@ -74,9 +73,6 @@ def managed(
             avoids pinning a full copy of every weight upfront (which
             would ~double host RAM). Only honored when ``use_stream=True``.
             Default True.
-        group_offload_record_stream: Pass-through to
-            ``apply_group_offloading``'s ``record_stream`` parameter.
-            Default False.
 
     Returns:
         The same pipeline object, augmented with a ``.mm`` attribute and
@@ -95,8 +91,6 @@ def managed(
             mm_kwargs["group_offload_use_stream"] = group_offload_use_stream
         if group_offload_low_cpu_mem is not _UNSET:
             mm_kwargs["group_offload_low_cpu_mem"] = group_offload_low_cpu_mem
-        if group_offload_record_stream is not _UNSET:
-            mm_kwargs["group_offload_record_stream"] = group_offload_record_stream
         mm = ModelManager(**mm_kwargs)
     else:
         # Detect a likely-confused caller: passing both an existing manager
@@ -106,7 +100,6 @@ def managed(
             "strategy": strategy,
             "group_offload_use_stream": group_offload_use_stream,
             "group_offload_low_cpu_mem": group_offload_low_cpu_mem,
-            "group_offload_record_stream": group_offload_record_stream,
         }
         explicit = {k: v for k, v in passed.items() if v is not _UNSET}
         if explicit:

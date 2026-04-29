@@ -47,12 +47,35 @@ class ModelManager:
     context vars, and automatic offload strategy resolution/application.
     """
 
+    # Heuristic factors used by the ``auto`` strategy resolver. The
+    # rationale: weights occupy GPU memory steadily; activations come and
+    # go on top. 1.5× is a reasonable middle-ground for typical diffusion
+    # pipelines (SDXL, Flux, Wan-class). Tweak via subclass / attribute set
+    # if your workload has unusually large or small activation footprint.
+    AUTO_NO_OFFLOAD_FACTOR = 1.5  # full pipeline must fit in VRAM × this margin
+    AUTO_MODEL_OFFLOAD_FACTOR = 1.5  # largest single component must fit × this
+    # If pipeline weights exceed RAM × this, log a loud warning that the
+    # workload likely won't fit on host memory at all.
+    AUTO_RAM_HEADROOM = 0.85
+    # When ``auto`` picks ``group_offload``, decide whether to flip
+    # ``low_cpu_mem_usage`` off. With ``low_cpu_mem_usage=False``
+    # diffusers pre-pins a full copy of every weight at apply time for
+    # faster transfers (pinning happens once, not per-transfer). With
+    # ``True``, pinning is per-transfer — slower steady-state but lower
+    # peak host RAM.
+    #
+    # The flip condition is "RAM ≥ pipeline_weights + headroom". The
+    # headroom covers OS + pipeline activations + transient buffers; we
+    # don't budget for the original weights because modern safetensors
+    # is mmap'd (originals may or may not be resident, and pages get
+    # evicted as needed). Default 16 GB is comfortable for most setups.
+    AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB = 16.0
+
     def __init__(
         self,
         strategy: str = "auto",
         group_offload_use_stream: bool = True,
         group_offload_low_cpu_mem: bool = True,
-        group_offload_record_stream: bool = False,
     ) -> None:
         self._lock = threading.RLock()
         self._component_cache: dict[str, Any] = {}
@@ -95,7 +118,6 @@ class ModelManager:
         self.offload_strategy = strategy  # validate through setter
         self._group_offload_use_stream: bool = bool(group_offload_use_stream)
         self._group_offload_low_cpu_mem: bool = bool(group_offload_low_cpu_mem)
-        self._group_offload_record_stream: bool = bool(group_offload_record_stream)
 
     # ------------------------------------------------------------------
     # Strategy properties
@@ -132,16 +154,6 @@ class ModelManager:
     def group_offload_low_cpu_mem(self, value: bool) -> None:
         with self._lock:
             self._group_offload_low_cpu_mem = bool(value)
-
-    @property
-    def group_offload_record_stream(self) -> bool:
-        with self._lock:
-            return self._group_offload_record_stream
-
-    @group_offload_record_stream.setter
-    def group_offload_record_stream(self, value: bool) -> None:
-        with self._lock:
-            self._group_offload_record_stream = bool(value)
 
     @property
     def applied_strategy(self) -> str | None:
@@ -493,8 +505,89 @@ class ModelManager:
     # Offload strategy resolution & application
     # ------------------------------------------------------------------
 
+    def _detect_available_ram_gb(self) -> tuple[float, float]:
+        """Return ``(available_gb, total_gb)`` of system RAM.
+
+        ``available`` is what's actually free for new allocations right now
+        (free + reclaimable cache, per ``psutil.virtual_memory()``). Returns
+        ``(0.0, 0.0)`` if psutil can't be queried.
+        """
+        try:
+            import psutil
+
+            vm = psutil.virtual_memory()
+            return vm.available / (1024**3), vm.total / (1024**3)
+        except Exception:
+            return 0.0, 0.0
+
+    def _detect_available_vram_gb(self, device: torch.device | str) -> tuple[float, float]:
+        """Return ``(available_gb, total_gb)`` of VRAM on *device*.
+
+        Uses ``torch.cuda.mem_get_info`` so the answer reflects whatever
+        else is already allocated on the GPU — the CUDA context, other
+        PyTorch tensors, other processes sharing the device. Returns
+        ``(0.0, 0.0)`` on failure (non-CUDA, driver issue, etc.).
+        """
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+            return free_bytes / (1024**3), total_bytes / (1024**3)
+        except Exception as e:
+            logger.warning("auto: VRAM detection failed (%s)", e)
+            return 0.0, 0.0
+
+    def _estimate_components_size_gb(self) -> tuple[float, float]:
+        """Return ``(total_size_gb, max_component_size_gb)`` of registered components.
+
+        Sums param + buffer bytes for every registered ``nn.Module``,
+        deduplicating by ``id(module)`` so aliased registrations count once.
+        Returns ``(0.0, 0.0)`` if no components are registered (or the
+        traversal fails for every component).
+        """
+        with self._lock:
+            components = list(self._managed_components.values())
+        seen_ids: set[int] = set()
+        total_bytes = 0
+        max_bytes = 0
+        for mod in components:
+            if id(mod) in seen_ids:
+                continue
+            seen_ids.add(id(mod))
+            try:
+                size = sum(p.numel() * p.element_size() for p in mod.parameters())
+                size += sum(b.numel() * b.element_size() for b in mod.buffers())
+            except Exception:
+                continue
+            total_bytes += size
+            if size > max_bytes:
+                max_bytes = size
+        return total_bytes / (1024**3), max_bytes / (1024**3)
+
     def resolve_offload_strategy(self, device: torch.device | str) -> str:
-        """Resolve ``"auto"`` to a concrete strategy based on available VRAM."""
+        """Resolve ``"auto"`` to a concrete strategy based on hardware + workload.
+
+        Uses **available** VRAM and RAM at decision time (not total) so
+        the answer reflects whatever else is on the system or GPU when
+        ``managed()`` is called: another process holding GPU memory, the
+        CUDA context overhead, the pipeline weights already mmap'd into
+        the page cache, etc. Component sizes come from registered
+        ``nn.Module`` parameters/buffers.
+
+        Decision rule:
+
+        - If pipeline weights × ``AUTO_NO_OFFLOAD_FACTOR`` ≤ available VRAM →
+          ``no_offload`` (everything fits on GPU with activation headroom).
+        - Else if largest component × ``AUTO_MODEL_OFFLOAD_FACTOR`` ≤
+          available VRAM → ``model_offload`` (one component swaps onto GPU
+          at a time).
+        - Otherwise → ``group_offload`` (leaf-level streaming).
+
+        If no components are registered yet, falls back to a tier table on
+        available VRAM: ``≥ 20 GB`` → no_offload; ``≥ 12 GB`` →
+        model_offload; else group_offload.
+
+        A warning is logged if pipeline weights exceed available RAM ×
+        ``AUTO_RAM_HEADROOM`` — that workload won't fit on host memory.
+        """
         strategy = self.offload_strategy
         if strategy != "auto":
             return strategy
@@ -503,17 +596,105 @@ class ModelManager:
         if device.type != "cuda":
             return "group_offload"
 
-        try:
-            total_mem = torch.cuda.get_device_properties(device).total_mem
-            total_gb = total_mem / (1024**3)
-        except Exception:
+        vram_avail_gb, vram_total_gb = self._detect_available_vram_gb(device)
+        if vram_avail_gb <= 0:
             return "group_offload"
 
-        if total_gb >= 20:
-            return "no_offload"
-        if total_gb >= 12:
-            return "model_offload"
-        return "group_offload"
+        ram_avail_gb, ram_total_gb = self._detect_available_ram_gb()
+        weights_gb, max_component_gb = self._estimate_components_size_gb()
+
+        if weights_gb == 0:
+            # No components registered yet — fall back to a tier table on
+            # *available* VRAM (still better than nothing).
+            if vram_avail_gb >= 20:
+                chosen = "no_offload"
+            elif vram_avail_gb >= 12:
+                chosen = "model_offload"
+            else:
+                chosen = "group_offload"
+            logger.info(
+                "auto: vram=%.1f / %.1f GB (no components yet) → %s",
+                vram_avail_gb,
+                vram_total_gb,
+                chosen,
+            )
+            return chosen
+
+        if ram_avail_gb > 0 and weights_gb > ram_avail_gb * self.AUTO_RAM_HEADROOM:
+            logger.warning(
+                "auto: pipeline weights (%.1f GB) likely exceed available RAM (%.1f GB). "
+                "Loading and offloading may fail.",
+                weights_gb,
+                ram_avail_gb,
+            )
+
+        if weights_gb * self.AUTO_NO_OFFLOAD_FACTOR <= vram_avail_gb:
+            chosen = "no_offload"
+        elif max_component_gb * self.AUTO_MODEL_OFFLOAD_FACTOR <= vram_avail_gb:
+            chosen = "model_offload"
+        else:
+            chosen = "group_offload"
+
+        logger.info(
+            "auto: vram=%.1f / %.1f GB, ram=%.1f / %.1f GB, pipeline=%.1f GB (largest component %.1f GB) → %s",
+            vram_avail_gb,
+            vram_total_gb,
+            ram_avail_gb,
+            ram_total_gb,
+            weights_gb,
+            max_component_gb,
+            chosen,
+        )
+
+        # Once the strategy is picked, also auto-tune any of its knobs
+        # we can sensibly derive from the same hardware picture. The user
+        # opted into "auto" → they want the manager to manage all of it.
+        if chosen == "group_offload":
+            self._auto_tune_group_offload(weights_gb, ram_avail_gb)
+
+        return chosen
+
+    def _auto_tune_group_offload(self, weights_gb: float, ram_gb: float) -> None:
+        """Auto-tune ``group_offload`` knobs based on RAM headroom.
+
+        *ram_gb* is the **available** RAM at decision time (not total),
+        so the budget reflects whatever else the system is currently
+        using. Flips ``low_cpu_mem_usage`` off when available RAM is
+        enough to absorb a full pinned copy of the pipeline weights plus
+        a fixed headroom for OS / activations / transient buffers:
+        ``low_cpu_mem=False`` if ``ram_gb >= weights_gb +
+        AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB``.
+
+        We don't budget for the *original* weights staying resident
+        because modern safetensors mmaps them — pages get evicted as
+        needed. The pinned copy is the dominant memory cost.
+
+        Mutates instance state — only called when ``auto`` resolved to
+        ``group_offload``, so the user has already opted into the manager
+        making this kind of decision.
+        """
+        if ram_gb <= 0 or weights_gb <= 0:
+            return  # No size info — leave defaults alone.
+
+        required_gb = weights_gb + self.AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB
+        new_low_cpu_mem = ram_gb < required_gb
+
+        with self._lock:
+            old = self._group_offload_low_cpu_mem
+            self._group_offload_low_cpu_mem = new_low_cpu_mem
+
+        if old != new_low_cpu_mem:
+            slack_gb = ram_gb - required_gb
+            logger.info(
+                "auto: tuned group_offload low_cpu_mem_usage=%s "
+                "(ram=%.1f GB available, required=%.1f GB = weights %.1f + headroom %.1f, slack=%+.1f GB)",
+                new_low_cpu_mem,
+                ram_gb,
+                required_gb,
+                weights_gb,
+                self.AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB,
+                slack_gb,
+            )
 
     def prepare_strategy_transition(self, new_strategy: str, device: torch.device | str) -> None:
         """Clean up the old offload strategy before applying *new_strategy*.
@@ -568,9 +749,10 @@ class ModelManager:
           pins a full copy of every weight upfront and holds it for the
           whole inference (~2× host RAM). Only honored when
           ``use_stream=True``. Default True.
-        - ``group_offload_record_stream`` — pass-through to
-          ``apply_group_offloading``'s ``record_stream`` parameter.
-          Default False.
+
+        ``record_stream`` is always passed as ``False`` — some models
+        produce numerical noise with ``record_stream=True`` and the
+        speed-up is negligible, so it's not worth exposing as a knob.
         """
         use_stream = self._group_offload_use_stream
         kwargs: dict[str, Any] = {
@@ -578,7 +760,7 @@ class ModelManager:
             "offload_device": torch.device("cpu"),
             "offload_type": "leaf_level",
             "use_stream": use_stream,
-            "record_stream": self._group_offload_record_stream,
+            "record_stream": False,
         }
         if use_stream and self._group_offload_low_cpu_mem:
             kwargs["low_cpu_mem_usage"] = True
@@ -643,6 +825,16 @@ class ModelManager:
             from diffusers.hooks.group_offloading import apply_group_offloading
 
             offload_kwargs = self._group_offload_kwargs(device)
+            # Log the resolved kwargs once so the actual config (especially
+            # whether low_cpu_mem_usage is being passed) is visible at run
+            # time without having to read source. low_cpu_mem_usage is
+            # absent from kwargs when use_stream=False (diffusers ignores it
+            # in that mode); show "absent" explicitly there.
+            logger.info(
+                "group_offload kwargs: use_stream=%s, low_cpu_mem_usage=%s",
+                offload_kwargs.get("use_stream"),
+                offload_kwargs.get("low_cpu_mem_usage", "absent"),
+            )
             for name, mod in unique:
                 try:
                     remove_offload_hooks(mod)
@@ -878,7 +1070,6 @@ class ModelManager:
             self._applied_strategy = None
             self._group_offload_use_stream = True
             self._group_offload_low_cpu_mem = True
-            self._group_offload_record_stream = False
         gc.collect()
         if torch.cuda.is_available():
             try:

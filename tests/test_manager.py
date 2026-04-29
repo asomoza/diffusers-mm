@@ -32,24 +32,21 @@ class TestModelManagerInit:
             ModelManager(strategy="bogus")
 
     def test_group_offload_default_options(self):
-        # Defaults: use_stream + low_cpu_mem ON, record_stream OFF. These
-        # match the "fast, RAM-conservative" leaf-level group offload that
-        # diffusers itself recommends — and avoid the 2× host-RAM trap of
-        # use_stream=True without low_cpu_mem_usage.
+        # Defaults: use_stream + low_cpu_mem ON. These match the "fast,
+        # RAM-conservative" leaf-level group offload that diffusers
+        # recommends — and avoid the 2× host-RAM trap of use_stream=True
+        # without low_cpu_mem_usage.
         mm = ModelManager()
         assert mm.group_offload_use_stream is True
         assert mm.group_offload_low_cpu_mem is True
-        assert mm.group_offload_record_stream is False
 
     def test_group_offload_options_overrides(self):
         mm = ModelManager(
             group_offload_use_stream=False,
             group_offload_low_cpu_mem=False,
-            group_offload_record_stream=True,
         )
         assert mm.group_offload_use_stream is False
         assert mm.group_offload_low_cpu_mem is False
-        assert mm.group_offload_record_stream is True
 
 
 class TestGroupOffloadKwargs:
@@ -60,7 +57,7 @@ class TestGroupOffloadKwargs:
         kwargs = mm._group_offload_kwargs("cpu")
         assert kwargs["offload_type"] == "leaf_level"
         assert kwargs["use_stream"] is True
-        assert kwargs["record_stream"] is False
+        assert kwargs["record_stream"] is False  # always hardcoded False
         assert kwargs["low_cpu_mem_usage"] is True  # gated on use_stream
 
     def test_low_cpu_mem_dropped_when_streams_off(self):
@@ -70,10 +67,12 @@ class TestGroupOffloadKwargs:
         # low_cpu_mem is documented as only honoured when use_stream=True.
         assert "low_cpu_mem_usage" not in kwargs
 
-    def test_record_stream_passed_through(self):
-        mm = ModelManager(group_offload_record_stream=True)
-        kwargs = mm._group_offload_kwargs("cpu")
-        assert kwargs["record_stream"] is True
+    def test_record_stream_always_false(self):
+        # record_stream is hardcoded — there's no constructor param for it
+        # because some models produce numerical noise with it on, and the
+        # speed gain isn't worth the configurability.
+        mm = ModelManager()
+        assert mm._group_offload_kwargs("cpu")["record_stream"] is False
 
 
 class TestComponentRegistration:
@@ -766,6 +765,199 @@ class TestResolveStrategy:
         assert mm.resolve_offload_strategy("cpu") == "group_offload"
 
 
+def _patch_vram(monkeypatch, available_gib: float, total_gib: float | None = None) -> None:
+    """Pretend any cuda device has *available_gib* free / *total_gib* total VRAM.
+
+    Patches ``torch.cuda.mem_get_info`` (the API the resolver actually uses
+    now). If *total_gib* is omitted, total = available.
+    """
+    total = total_gib if total_gib is not None else available_gib
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda d=None: (int(available_gib * 1024**3), int(total * 1024**3)),
+    )
+
+
+class TestComponentSizeEstimation:
+    def test_empty_registry(self):
+        mm = ModelManager()
+        total, max_size = mm._estimate_components_size_gb()
+        assert total == 0.0
+        assert max_size == 0.0
+
+    def test_single_component(self):
+        mm = ModelManager()
+        m = DummyModel()
+        mm.register_component("a", m)
+        total, max_size = mm._estimate_components_size_gb()
+        # DummyModel is small but non-zero.
+        assert total > 0.0
+        assert max_size == total  # only one component
+
+    def test_aliases_counted_once(self):
+        # Same module under two names — should count once toward total.
+        mm = ModelManager()
+        m = DummyModel()
+        mm.register_component("primary", m)
+        mm.register_component("alias", m)
+        total, max_size = mm._estimate_components_size_gb()
+
+        mm2 = ModelManager()
+        mm2.register_component("only", m)
+        total2, max_size2 = mm2._estimate_components_size_gb()
+
+        assert total == total2
+        assert max_size == max_size2
+
+    def test_two_distinct_components_sum(self):
+        mm = ModelManager()
+        m1 = DummyModel()
+        m2 = DummyModel()
+        mm.register_component("a", m1)
+        mm.register_component("b", m2)
+        total, max_size = mm._estimate_components_size_gb()
+        # Two equal-sized components → total = 2× max_size.
+        assert total == pytest.approx(max_size * 2, rel=0.01)
+
+
+class TestAutoResolutionSized:
+    """Auto resolution should consider component sizes, not just VRAM tiers."""
+
+    def test_huge_vram_picks_no_offload(self, monkeypatch):
+        _patch_vram(monkeypatch, 100.0)
+        mm = ModelManager(strategy="auto")
+        mm.register_component("model", DummyModel())
+        assert mm.resolve_offload_strategy("cuda") == "no_offload"
+
+    def test_pipeline_too_large_for_no_offload_picks_model_offload(self, monkeypatch):
+        # Simulate: 24 GB VRAM, but pipeline weights estimated at 20 GB
+        # (so 20 × 1.5 = 30 > 24 → can't fit fully). One component alone
+        # at ~10 GB fits (10 × 1.5 = 15 ≤ 24) → model_offload.
+        _patch_vram(monkeypatch, 24.0)
+        mm = ModelManager(strategy="auto")
+
+        # Stub the size estimation to return values that exercise the
+        # decision logic without actually allocating 30 GB of params.
+        mm._estimate_components_size_gb = lambda: (20.0, 10.0)
+        assert mm.resolve_offload_strategy("cuda") == "model_offload"
+
+    def test_largest_component_exceeds_vram_picks_group_offload(self, monkeypatch):
+        # 12 GB VRAM, largest component 10 GB → 10 × 1.5 = 15 > 12 → group_offload.
+        _patch_vram(monkeypatch, 12.0)
+        mm = ModelManager(strategy="auto")
+        mm._estimate_components_size_gb = lambda: (15.0, 10.0)
+        assert mm.resolve_offload_strategy("cuda") == "group_offload"
+
+    def test_empty_registry_falls_back_to_vram_tier(self, monkeypatch):
+        _patch_vram(monkeypatch, 16.0)
+        mm = ModelManager(strategy="auto")
+        # No components → 16 GB falls in the [12, 20) tier → model_offload.
+        assert mm.resolve_offload_strategy("cuda") == "model_offload"
+
+    def test_vram_detection_failure_falls_back_to_group_offload(self, monkeypatch):
+        def boom(d=None):
+            raise RuntimeError("no cuda here")
+
+        monkeypatch.setattr(torch.cuda, "mem_get_info", boom)
+        mm = ModelManager(strategy="auto")
+        mm.register_component("model", DummyModel())
+        assert mm.resolve_offload_strategy("cuda") == "group_offload"
+
+
+class TestRamDetection:
+    def test_psutil_returns_positive(self):
+        mm = ModelManager()
+        # psutil is a hard dep — should always return positive numbers.
+        avail, total = mm._detect_available_ram_gb()
+        assert avail > 0.0
+        assert total >= avail
+
+    def test_warns_when_pipeline_exceeds_ram(self, monkeypatch, caplog):
+        _patch_vram(monkeypatch, 24.0)
+        mm = ModelManager(strategy="auto")
+        # Pretend 16 GB available RAM, pipeline 30 GB.
+        mm._detect_available_ram_gb = lambda: (16.0, 16.0)
+        mm._estimate_components_size_gb = lambda: (30.0, 12.0)
+
+        with caplog.at_level("WARNING"):
+            mm.resolve_offload_strategy("cuda")
+        assert any("exceed available RAM" in rec.message for rec in caplog.records)
+
+
+class TestAutoTuneGroupOffload:
+    """When auto picks group_offload, knobs should be tuned to the hardware."""
+
+    def test_abundant_ram_flips_low_cpu_mem_off(self, monkeypatch):
+        # 64 GB available RAM, 8 GB pipeline → required = 8 + 16 = 24 ≤ 64 → flip off.
+        _patch_vram(monkeypatch, 4.0)
+        mm = ModelManager(strategy="auto")
+        mm._detect_available_ram_gb = lambda: (64.0, 64.0)
+        mm._estimate_components_size_gb = lambda: (8.0, 5.0)
+        assert mm.group_offload_low_cpu_mem is True
+
+        chosen = mm.resolve_offload_strategy("cuda")
+        assert chosen == "group_offload"
+        assert mm.group_offload_low_cpu_mem is False
+
+    def test_users_real_setup_flips_low_cpu_mem_off(self, monkeypatch):
+        # 123.4 GB available RAM / 65.7 GB pipeline: required = 81.7 ≤ 123.4 → flip off.
+        _patch_vram(monkeypatch, 4.0)
+        mm = ModelManager(strategy="auto")
+        mm._detect_available_ram_gb = lambda: (123.4, 128.0)
+        mm._estimate_components_size_gb = lambda: (65.7, 35.4)
+
+        mm.resolve_offload_strategy("cuda")
+        assert mm.group_offload_low_cpu_mem is False
+
+    def test_tight_ram_keeps_low_cpu_mem_on(self, monkeypatch):
+        # 32 GB available RAM, 24 GB pipeline → required = 40 > 32 → keep True.
+        _patch_vram(monkeypatch, 4.0)
+        mm = ModelManager(strategy="auto")
+        mm._detect_available_ram_gb = lambda: (32.0, 32.0)
+        mm._estimate_components_size_gb = lambda: (24.0, 12.0)
+        assert mm.group_offload_low_cpu_mem is True
+
+        chosen = mm.resolve_offload_strategy("cuda")
+        assert chosen == "group_offload"
+        assert mm.group_offload_low_cpu_mem is True
+
+    def test_loaded_system_keeps_low_cpu_mem_on_despite_high_total(self, monkeypatch):
+        # 128 GB total RAM but only 20 GB *available* (something else is hogging it),
+        # 30 GB pipeline → required = 46 > 20 → keep True. Demonstrates that
+        # using available rather than total catches loaded systems.
+        _patch_vram(monkeypatch, 4.0)
+        mm = ModelManager(strategy="auto")
+        mm._detect_available_ram_gb = lambda: (20.0, 128.0)
+        mm._estimate_components_size_gb = lambda: (30.0, 15.0)
+
+        mm.resolve_offload_strategy("cuda")
+        assert mm.group_offload_low_cpu_mem is True
+
+    def test_explicit_strategy_does_not_auto_tune(self, monkeypatch):
+        # User picked group_offload directly → manager should NOT touch
+        # their knob choice, even if RAM is abundant.
+        _patch_vram(monkeypatch, 4.0)
+        mm = ModelManager(strategy="group_offload", group_offload_low_cpu_mem=True)
+        mm._detect_available_ram_gb = lambda: (64.0, 64.0)
+        mm._estimate_components_size_gb = lambda: (8.0, 5.0)
+
+        mm.resolve_offload_strategy("cuda")
+        # Explicit strategy → resolve returns immediately without auto-tuning.
+        assert mm.group_offload_low_cpu_mem is True
+
+    def test_no_size_info_skips_tuning(self, monkeypatch):
+        # Auto with no components → falls back to VRAM tier table; even if
+        # that picks group_offload, we have no weights estimate to base
+        # tuning on, so leave knobs alone.
+        _patch_vram(monkeypatch, 4.0)
+        mm = ModelManager(strategy="auto")
+        # No components registered.
+        mm.resolve_offload_strategy("cuda")
+        # Default unchanged.
+        assert mm.group_offload_low_cpu_mem is True
+
+
 class TestApplyStrategyNoOffload:
     def test_no_offload_moves_to_device(self):
         mm = ModelManager(strategy="no_offload")
@@ -849,11 +1041,10 @@ class TestClear:
     def test_clears_everything(self):
         # Override the defaults to non-default values to verify clear()
         # resets back to the documented defaults (use_stream=True,
-        # low_cpu_mem=True, record_stream=False).
+        # low_cpu_mem=True).
         mm = ModelManager(
             group_offload_use_stream=False,
             group_offload_low_cpu_mem=False,
-            group_offload_record_stream=True,
         )
         mm.register_component("model", DummyModel())
         mm.set_cached("key", "value")
@@ -866,7 +1057,6 @@ class TestClear:
         assert mm.applied_strategy is None
         assert mm.group_offload_use_stream is True
         assert mm.group_offload_low_cpu_mem is True
-        assert mm.group_offload_record_stream is False
         assert mm.component_names == []
 
 
