@@ -8,7 +8,7 @@ import gc
 import hashlib
 import logging
 import threading
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from typing import Any
 
 import torch
@@ -237,6 +237,61 @@ class ModelManager:
     def set_cached(self, hash_key: str, obj: Any) -> None:
         with self._lock:
             self._component_cache[hash_key] = obj
+
+    def load_component(
+        self,
+        name: str,
+        identifier: str,
+        factory: Callable[[], nn.Module],
+    ) -> nn.Module:
+        """Load a component, reusing a cached instance keyed by *identifier*.
+
+        On first call with a given *identifier*, invokes ``factory()`` to
+        produce the module, caches it under ``component_hash(identifier)``,
+        and registers it under *name*. On subsequent calls with the same
+        identifier the cached module is reused — the factory is **not**
+        invoked. The cached module is registered under whatever *name*
+        the caller passes, so the same module can end up aliased under
+        multiple names (which the registry handles correctly via id-dedup).
+
+        This is the right tool for sharing heavy components across several
+        pipelines (e.g. a T5 text encoder used by both a base and a refiner
+        pipeline) when you don't have an existing pipeline to share *from*.
+        When you *do* have one, just pass its components into the second
+        pipeline's ``from_pretrained`` kwargs — diffusers-mm's identity
+        dedup handles that case without any new API.
+
+        The factory is called **outside** the manager's lock (loads can be
+        slow). If two threads race for the same uncached identifier, both
+        will run the factory; the first cache write wins and the second
+        thread will use the winning module (the loser's module is
+        discarded — wasteful but not incorrect).
+        """
+        cache_key = self.component_hash(identifier)
+
+        with self._lock:
+            cached = self._component_cache.get(cache_key)
+
+        if cached is not None and isinstance(cached, nn.Module):
+            self.register_component(name, cached)
+            logger.info("load_component: cache hit for identifier %r → %r", identifier, name)
+            return cached
+
+        module = factory()
+        if not isinstance(module, nn.Module):
+            raise TypeError(f"load_component factory must return an nn.Module, got {type(module).__name__}")
+
+        with self._lock:
+            winner = self._component_cache.get(cache_key)
+            if winner is not None and isinstance(winner, nn.Module):
+                module = winner
+                logger.info("load_component: lost cache race for identifier %r, using winner", identifier)
+            else:
+                self._component_cache[cache_key] = module
+                logger.info("load_component: cache miss for identifier %r, loaded → %r", identifier, name)
+
+        self.register_component(name, module)
+        return module
 
     # ------------------------------------------------------------------
     # Device / dtype scope

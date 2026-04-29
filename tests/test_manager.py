@@ -298,6 +298,77 @@ class TestCache:
         assert mm.get_cached("key") is obj
 
 
+class TestLoadComponent:
+    def test_first_call_invokes_factory_and_caches(self):
+        mm = ModelManager()
+        calls: list[bool] = []
+        m = DummyModel()
+
+        def factory():
+            calls.append(True)
+            return m
+
+        result = mm.load_component("text_encoder", "id-1", factory)
+        assert result is m
+        assert mm.get_component("text_encoder") is m
+        assert mm.get_cached(ModelManager.component_hash("id-1")) is m
+        assert len(calls) == 1
+
+    def test_second_call_with_same_identifier_skips_factory(self):
+        mm = ModelManager()
+        calls: list[bool] = []
+        m = DummyModel()
+
+        def factory():
+            calls.append(True)
+            return m
+
+        first = mm.load_component("text_encoder", "id-1", factory)
+        second = mm.load_component("text_encoder", "id-1", factory)
+        assert first is second is m
+        assert len(calls) == 1
+
+    def test_cache_hit_under_different_name_aliases_the_module(self):
+        # Same identifier, different name → module is aliased under both
+        # names. The factory must NOT be called the second time.
+        mm = ModelManager()
+        m = DummyModel()
+        first = mm.load_component("primary", "id-1", lambda: m)
+
+        def trap_factory():
+            raise AssertionError("factory should not be called on cache hit")
+
+        second = mm.load_component("alias", "id-1", trap_factory)
+        assert first is second is m
+        assert mm.get_component("primary") is m
+        assert mm.get_component("alias") is m
+
+    def test_factory_returning_non_module_raises(self):
+        mm = ModelManager()
+        with pytest.raises(TypeError, match="factory must return"):
+            mm.load_component("text_encoder", "id-1", lambda: "not a module")
+
+    def test_different_identifiers_are_kept_separate(self):
+        mm = ModelManager()
+        m1, m2 = DummyModel(), DummyModel()
+        first = mm.load_component("a", "id-1", lambda: m1)
+        second = mm.load_component("b", "id-2", lambda: m2)
+        assert first is m1
+        assert second is m2
+        assert mm.get_component("a") is m1
+        assert mm.get_component("b") is m2
+
+    def test_cache_hit_treats_aliasing_correctly_under_apply_strategy(self):
+        # The cached-module-via-alias case must integrate with the
+        # apply-strategy / id-dedup machinery from earlier iterations.
+        mm = ModelManager(strategy="no_offload")
+        m = DummyModel()
+        mm.load_component("primary", "id-1", lambda: m)
+        mm.load_component("alias", "id-1", lambda: m)  # cache hit
+        mm.apply_offload_strategy("cpu")
+        assert mm._component_strategies == {"primary": "no_offload", "alias": "no_offload"}
+
+
 class TestDeviceScope:
     def test_sets_and_resets_device(self):
         mm = ModelManager()
