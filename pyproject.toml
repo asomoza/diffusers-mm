@@ -1,0 +1,63 @@
+[project]
+name = "diffusers-mm"
+version = "0.1.0"
+description = "Smart model management for Hugging Face Diffusers pipelines"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Alvaro Somoza" }]
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "diffusers>=0.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.11",
+]
+test = [
+    "pytest>=9",
+    "pytest-cov>=7",
+]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/diffusers_mm"]
+
+[tool.ruff]
+line-length = 119
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+lines-after-imports = 2
+known-first-party = ["diffusers_mm"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: tests that require a CUDA device (opt-in via DIFFUSERS_MM_RUN_GPU_TESTS=1)",
+    "slow: long-running tests (opt-in)",
+]

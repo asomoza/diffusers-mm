@@ -1,0 +1,460 @@
+"""Core ModelManager — thread-safe model lifecycle and offload strategy management."""
+
+from __future__ import annotations
+
+import contextlib
+import contextvars
+import gc
+import hashlib
+import logging
+import threading
+from collections.abc import Generator
+from typing import Any
+
+import torch
+
+from diffusers_mm.hooks import remove_offload_hooks
+
+
+logger = logging.getLogger(__name__)
+
+OFFLOAD_STRATEGIES = ("auto", "no_offload", "model_offload", "sequential_group_offload", "group_offload")
+
+_SCOPED_DEVICE: contextvars.ContextVar[torch.device | None] = contextvars.ContextVar(
+    "diffusers_mm_scoped_device", default=None
+)
+_SCOPED_DTYPE: contextvars.ContextVar[torch.dtype | None] = contextvars.ContextVar(
+    "diffusers_mm_scoped_dtype", default=None
+)
+
+
+def get_device() -> torch.device | None:
+    """Return the device set by the nearest enclosing ``device_scope``."""
+    return _SCOPED_DEVICE.get()
+
+
+def get_dtype() -> torch.dtype | None:
+    """Return the dtype set by the nearest enclosing ``device_scope``."""
+    return _SCOPED_DTYPE.get()
+
+
+class ModelManager:
+    """Thread-safe manager for model component lifecycle and offload strategies.
+
+    Handles component registration, hash-keyed caching, device scoping via
+    context vars, and automatic offload strategy resolution/application.
+    """
+
+    def __init__(
+        self,
+        strategy: str = "auto",
+        group_offload_use_stream: bool = False,
+        group_offload_low_cpu_mem: bool = False,
+    ) -> None:
+        self._lock = threading.RLock()
+        self._component_cache: dict[str, Any] = {}
+        self._managed_components: dict[str, Any] = {}
+        self._applied_strategy: str | None = None
+
+        self._offload_strategy: str = "auto"
+        self.offload_strategy = strategy  # validate through setter
+        self._group_offload_use_stream: bool = group_offload_use_stream
+        self._group_offload_low_cpu_mem: bool = group_offload_low_cpu_mem
+
+    # ------------------------------------------------------------------
+    # Strategy properties
+    # ------------------------------------------------------------------
+
+    @property
+    def offload_strategy(self) -> str:
+        with self._lock:
+            return self._offload_strategy
+
+    @offload_strategy.setter
+    def offload_strategy(self, value: str) -> None:
+        if value not in OFFLOAD_STRATEGIES:
+            raise ValueError(f"Unknown offload strategy {value!r}. Must be one of {OFFLOAD_STRATEGIES}")
+        with self._lock:
+            self._offload_strategy = value
+
+    @property
+    def group_offload_use_stream(self) -> bool:
+        with self._lock:
+            return self._group_offload_use_stream
+
+    @group_offload_use_stream.setter
+    def group_offload_use_stream(self, value: bool) -> None:
+        with self._lock:
+            self._group_offload_use_stream = bool(value)
+
+    @property
+    def group_offload_low_cpu_mem(self) -> bool:
+        with self._lock:
+            return self._group_offload_low_cpu_mem
+
+    @group_offload_low_cpu_mem.setter
+    def group_offload_low_cpu_mem(self, value: bool) -> None:
+        with self._lock:
+            self._group_offload_low_cpu_mem = bool(value)
+
+    @property
+    def applied_strategy(self) -> str | None:
+        with self._lock:
+            return self._applied_strategy
+
+    # ------------------------------------------------------------------
+    # Component registration
+    # ------------------------------------------------------------------
+
+    def register_component(self, name: str, module: Any) -> None:
+        """Register a named nn.Module component for lifecycle management.
+
+        If the component differs from the currently registered one, resets
+        the applied strategy so the next ``apply_offload_strategy`` call
+        re-applies placement/hooks to the new module.
+        """
+        with self._lock:
+            existing = self._managed_components.get(name)
+            if existing is not module:
+                self._applied_strategy = None
+            self._managed_components[name] = module
+
+    def get_component(self, name: str) -> Any | None:
+        """Retrieve a managed component by name."""
+        with self._lock:
+            return self._managed_components.get(name)
+
+    @property
+    def component_names(self) -> list[str]:
+        """Return names of all registered components."""
+        with self._lock:
+            return list(self._managed_components.keys())
+
+    # ------------------------------------------------------------------
+    # Hash-keyed cache
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def component_hash(identifier: str) -> str:
+        """Deterministic 16-char hex hash for cache keys."""
+        return hashlib.sha256(identifier.encode()).hexdigest()[:16]
+
+    def get_cached(self, hash_key: str) -> Any | None:
+        with self._lock:
+            return self._component_cache.get(hash_key)
+
+    def set_cached(self, hash_key: str, obj: Any) -> None:
+        with self._lock:
+            self._component_cache[hash_key] = obj
+
+    # ------------------------------------------------------------------
+    # Device / dtype scope
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def device_scope(self, *, device: torch.device | str, dtype: torch.dtype | None = None) -> Generator[None]:
+        """Context manager that sets scoped device/dtype via context vars."""
+        if isinstance(device, str):
+            device = torch.device(device)
+        dev_token = _SCOPED_DEVICE.set(device)
+        dtype_token = _SCOPED_DTYPE.set(dtype)
+        try:
+            yield
+        finally:
+            _SCOPED_DEVICE.reset(dev_token)
+            _SCOPED_DTYPE.reset(dtype_token)
+
+    # ------------------------------------------------------------------
+    # Offload strategy resolution & application
+    # ------------------------------------------------------------------
+
+    def resolve_offload_strategy(self, device: torch.device | str) -> str:
+        """Resolve ``"auto"`` to a concrete strategy based on available VRAM."""
+        strategy = self.offload_strategy
+        if strategy != "auto":
+            return strategy
+
+        device = torch.device(device) if isinstance(device, str) else device
+        if device.type != "cuda":
+            return "group_offload"
+
+        try:
+            total_mem = torch.cuda.get_device_properties(device).total_mem
+            total_gb = total_mem / (1024**3)
+        except Exception:
+            return "group_offload"
+
+        if total_gb >= 20:
+            return "no_offload"
+        if total_gb >= 12:
+            return "model_offload"
+        if total_gb >= 8:
+            return "sequential_group_offload"
+        return "group_offload"
+
+    def prepare_strategy_transition(self, new_strategy: str, device: torch.device | str) -> None:
+        """Clean up the old offload strategy before applying *new_strategy*."""
+        with self._lock:
+            old = self._applied_strategy
+            if old == new_strategy:
+                return
+
+            if old in ("group_offload", "sequential_group_offload"):
+                for name, mod in self._managed_components.items():
+                    remove_offload_hooks(mod)
+                    if hasattr(mod, "to"):
+                        mod.to("cpu")
+                    logger.debug("Removed offload hooks from %s, moved to CPU", name)
+            elif old in ("no_offload", "model_offload"):
+                for name, mod in self._managed_components.items():
+                    if hasattr(mod, "to"):
+                        mod.to("cpu")
+                        logger.debug("Moved %s to CPU (leaving %s)", name, old)
+
+            self._applied_strategy = new_strategy
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _group_offload_kwargs(self, device: torch.device | str) -> dict[str, Any]:
+        """Build kwargs for ``apply_group_offloading``."""
+        use_stream = self._group_offload_use_stream
+        kwargs: dict[str, Any] = {
+            "onload_device": torch.device(device) if isinstance(device, str) else device,
+            "offload_device": torch.device("cpu"),
+            "offload_type": "leaf_level",
+            "use_stream": use_stream,
+        }
+        if use_stream and self._group_offload_low_cpu_mem:
+            kwargs["low_cpu_mem_usage"] = True
+        return kwargs
+
+    def apply_offload_strategy(self, device: torch.device | str) -> str:
+        """Resolve and apply the current offload strategy to all managed components.
+
+        Returns the resolved (concrete) strategy name. If the resolved strategy
+        is already applied this is a no-op.
+        """
+        strategy = self.resolve_offload_strategy(device)
+
+        with self._lock:
+            if not self._managed_components:
+                self._applied_strategy = strategy
+                return strategy
+            if self._applied_strategy == strategy:
+                return strategy
+
+        self.prepare_strategy_transition(strategy, device)
+
+        if strategy == "no_offload":
+            with self._lock:
+                components = list(self._managed_components.items())
+            for name, mod in components:
+                if hasattr(mod, "to"):
+                    mod.to(device)
+                    logger.info("no_offload: moved %s to %s", name, device)
+
+        elif strategy == "group_offload":
+            from diffusers.hooks.group_offloading import apply_group_offloading
+
+            offload_kwargs = self._group_offload_kwargs(device)
+            with self._lock:
+                components = list(self._managed_components.items())
+            for name, mod in components:
+                try:
+                    remove_offload_hooks(mod)
+                    apply_group_offloading(mod, **offload_kwargs)
+                    logger.info("Group offload enabled for %s", name)
+                except Exception as e:
+                    logger.warning("Failed to enable group offload for %s: %s", name, e)
+
+        elif strategy == "sequential_group_offload":
+            with self._lock:
+                components = list(self._managed_components.items())
+            for name, mod in components:
+                if hasattr(mod, "to"):
+                    mod.to("cpu")
+            logger.info("sequential_group_offload: all components on CPU, hooks deferred")
+
+        elif strategy == "model_offload":
+            logger.info("model_offload: all components remain on CPU")
+
+        return strategy
+
+    def reapply_group_offload(self, component_name: str, device: torch.device | str) -> None:
+        """Re-apply group offload hooks to a single component.
+
+        Useful after modifying a component's module structure (e.g. loading
+        LoRA adapters) so that new submodules get offload hooks.
+        """
+        if self._applied_strategy != "group_offload":
+            return
+
+        from diffusers.hooks.group_offloading import apply_group_offloading
+
+        with self._lock:
+            mod = self._managed_components.get(component_name)
+        if mod is None:
+            return
+
+        offload_kwargs = self._group_offload_kwargs(device)
+        remove_offload_hooks(mod)
+        apply_group_offloading(mod, **offload_kwargs)
+        logger.info("Re-applied group offload hooks for %s", component_name)
+
+    # ------------------------------------------------------------------
+    # use_components context manager
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def use_components(
+        self,
+        *names: str,
+        device: torch.device | str,
+        strategy_override: str | None = None,
+    ) -> Generator[None]:
+        """Context manager that places named components on *device*.
+
+        Behaviour depends on the active offload strategy:
+
+        - ``no_offload`` / ``group_offload``: no-op yield.
+        - ``model_offload``: bulk CPU <-> GPU move.
+        - ``sequential_group_offload``: apply group-offload hooks on enter,
+          remove hooks + move to CPU on exit.
+
+        *strategy_override* lets callers force a different strategy for these
+        components (e.g. ``"model_offload"`` for small models like VAE that
+        are too granular for leaf-level hook offloading).
+        """
+        strategy = self._applied_strategy
+        if strategy is None:
+            strategy = self.apply_offload_strategy(device)
+        if strategy_override is not None:
+            strategy = strategy_override
+
+        if strategy in ("no_offload", "group_offload"):
+            yield
+            return
+
+        modules: list[tuple[str, Any]] = []
+        with self._lock:
+            for n in names:
+                mod = self._managed_components.get(n)
+                if mod is not None and hasattr(mod, "to"):
+                    modules.append((n, mod))
+
+        if strategy == "model_offload":
+            actual_strategy = self._applied_strategy
+            for name, mod in modules:
+                remove_offload_hooks(mod)
+                mod.to(device)
+                logger.debug("model_offload: moved %s to %s", name, device)
+            try:
+                yield
+            finally:
+                for name, mod in modules:
+                    mod.to("cpu")
+                    logger.debug("model_offload: moved %s back to CPU", name)
+                # Restore group_offload hooks if the real strategy is group_offload
+                # and we only used model_offload as a temporary override.
+                if actual_strategy == "group_offload":
+                    from diffusers.hooks.group_offloading import apply_group_offloading
+
+                    restore_kwargs = self._group_offload_kwargs(device)
+                    for name, mod in modules:
+                        try:
+                            apply_group_offloading(mod, **restore_kwargs)
+                            logger.debug("model_offload: restored group_offload hooks on %s", name)
+                        except Exception as e:
+                            logger.warning("model_offload: failed to restore hooks on %s: %s", name, e)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        elif strategy == "sequential_group_offload":
+            from diffusers.hooks.group_offloading import apply_group_offloading
+
+            offload_kwargs = self._group_offload_kwargs(device)
+            for name, mod in modules:
+                try:
+                    apply_group_offloading(mod, **offload_kwargs)
+                    logger.debug("sequential_group_offload: hooks applied to %s", name)
+                except Exception as e:
+                    logger.warning("sequential_group_offload: failed to hook %s: %s", name, e)
+            try:
+                yield
+            finally:
+                for name, mod in modules:
+                    remove_offload_hooks(mod)
+                    if hasattr(mod, "to"):
+                        mod.to("cpu")
+                    logger.debug("sequential_group_offload: cleaned up %s", name)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        else:
+            yield
+
+    # ------------------------------------------------------------------
+    # Debugging
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def record_memory_history(
+        self,
+        output_path: str,
+        *,
+        max_entries: int = 100_000,
+    ) -> Generator[None]:
+        """Record CUDA allocations during the context and dump a snapshot on exit.
+
+        Wraps ``torch.cuda.memory._record_memory_history`` and writes the
+        snapshot to *output_path*. Visualize locally with::
+
+            python -m torch.cuda._memory_viz trace_plot snapshot.pickle -o trace.html
+
+        (or ``segment_plot`` / ``stats`` / ``compare`` — see ``--help``).
+        The hosted viewer at https://docs.pytorch.org/memory_viz reads the
+        same pickle if you'd rather drag-and-drop. Useful when a user
+        reports an unexpected OOM and you need to see where the spike
+        came from.
+
+        No-op when CUDA is unavailable so debug calls are safe to leave in
+        place across CPU-only test runs.
+        """
+        if not torch.cuda.is_available():
+            yield
+            return
+
+        torch.cuda.memory._record_memory_history(max_entries=max_entries)
+        logger.info("Recording CUDA memory history (max_entries=%d)", max_entries)
+        try:
+            yield
+        finally:
+            try:
+                torch.cuda.memory._dump_snapshot(output_path)
+                logger.info("Dumped CUDA memory snapshot to %s", output_path)
+            except Exception as e:
+                logger.warning("Failed to dump CUDA memory snapshot: %s", e)
+            finally:
+                torch.cuda.memory._record_memory_history(enabled=None)
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def clear(self) -> None:
+        """Free all components, caches, and CUDA memory."""
+        with self._lock:
+            self._component_cache.clear()
+            self._managed_components.clear()
+            self._applied_strategy = None
+            self._group_offload_use_stream = False
+            self._group_offload_low_cpu_mem = False
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass

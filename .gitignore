@@ -1,0 +1,41 @@
+# Virtualenv / IDE
+.venv/
+.vscode/
+.idea/
+.directory
+
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+*.pyc
+*.pyo
+*.pyd
+**/__pycache__/
+
+# Test / coverage / cache
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Diffusers / HuggingFace local artifacts
+/models/
+/outputs/
+/datasets/
+.cache/
+hub/
+
+# Logs / OS / env
+*.log
+.DS_Store
+.env
+.env.*
+
+# uv lockfile (library — consumers resolve their own)
+uv.lock
+
+# Claude / local tooling
+.claude/
