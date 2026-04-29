@@ -12,6 +12,7 @@ from collections.abc import Generator
 from typing import Any
 
 import torch
+from torch import nn
 
 from diffusers_mm.hooks import remove_offload_hooks
 
@@ -54,6 +55,12 @@ class ModelManager:
         self._lock = threading.RLock()
         self._component_cache: dict[str, Any] = {}
         self._managed_components: dict[str, Any] = {}
+        # Per-component applied strategy. Names absent from this dict are
+        # "pending" — they were registered after a strategy was last applied
+        # and need to be hooked/placed on the next apply_offload_strategy
+        # call. Cleared wholesale on a strategy *transition* so every
+        # component gets re-applied under the new regime.
+        self._component_strategies: dict[str, str] = {}
         self._applied_strategy: str | None = None
 
         self._offload_strategy: str = "auto"
@@ -109,15 +116,47 @@ class ModelManager:
     def register_component(self, name: str, module: Any) -> None:
         """Register a named nn.Module component for lifecycle management.
 
-        If the component differs from the currently registered one, resets
-        the applied strategy so the next ``apply_offload_strategy`` call
-        re-applies placement/hooks to the new module.
+        Re-registering the same ``(name, module)`` pair is a no-op — useful
+        when a pipeline is recreated against the same long-lived manager
+        and re-declares its components.
+
+        Re-registering a *different* module under an existing name marks
+        that slot as needing strategy re-application on the next
+        ``apply_offload_strategy`` call. The global applied-strategy state
+        is left untouched so that other components keep their hooks.
+
+        Adding a brand-new name leaves the slot pending: only the new
+        component will be touched on the next apply call.
         """
         with self._lock:
             existing = self._managed_components.get(name)
-            if existing is not module:
-                self._applied_strategy = None
+            if existing is module:
+                return
             self._managed_components[name] = module
+            self._component_strategies.pop(name, None)
+
+    def register_components(self, source: Any) -> list[str]:
+        """Register every ``nn.Module`` exposed by *source*.
+
+        *source* may be a ``DiffusionPipeline``-like object that exposes a
+        ``components`` dict, or a plain ``dict[str, nn.Module]``. Returns
+        the list of names that were registered (skipping non-modules).
+        """
+        if isinstance(source, dict):
+            components = source
+        elif hasattr(source, "components") and isinstance(source.components, dict):
+            components = source.components
+        else:
+            raise TypeError(
+                f"register_components expected a pipeline (with .components) or a dict, got {type(source).__name__}"
+            )
+
+        registered: list[str] = []
+        for name, comp in components.items():
+            if isinstance(comp, nn.Module):
+                self.register_component(name, comp)
+                registered.append(name)
+        return registered
 
     def get_component(self, name: str) -> Any | None:
         """Retrieve a managed component by name."""
@@ -193,24 +232,34 @@ class ModelManager:
         return "group_offload"
 
     def prepare_strategy_transition(self, new_strategy: str, device: torch.device | str) -> None:
-        """Clean up the old offload strategy before applying *new_strategy*."""
+        """Clean up the old offload strategy before applying *new_strategy*.
+
+        Iterates components deduplicated by ``id(module)`` so that aliased
+        names (the same module registered under multiple names) only get
+        cleaned up once. Clears per-component strategy state so every
+        component will be re-applied under the new strategy.
+        """
         with self._lock:
             old = self._applied_strategy
             if old == new_strategy:
                 return
 
-            if old in ("group_offload", "sequential_group_offload"):
-                for name, mod in self._managed_components.items():
+            seen_ids: set[int] = set()
+            for name, mod in self._managed_components.items():
+                if id(mod) in seen_ids:
+                    continue
+                seen_ids.add(id(mod))
+                if old in ("group_offload", "sequential_group_offload"):
                     remove_offload_hooks(mod)
                     if hasattr(mod, "to"):
                         mod.to("cpu")
                     logger.debug("Removed offload hooks from %s, moved to CPU", name)
-            elif old in ("no_offload", "model_offload"):
-                for name, mod in self._managed_components.items():
+                elif old in ("no_offload", "model_offload"):
                     if hasattr(mod, "to"):
                         mod.to("cpu")
                         logger.debug("Moved %s to CPU (leaving %s)", name, old)
 
+            self._component_strategies.clear()
             self._applied_strategy = new_strategy
 
         gc.collect()
@@ -231,10 +280,14 @@ class ModelManager:
         return kwargs
 
     def apply_offload_strategy(self, device: torch.device | str) -> str:
-        """Resolve and apply the current offload strategy to all managed components.
+        """Resolve and apply the current offload strategy to managed components.
 
-        Returns the resolved (concrete) strategy name. If the resolved strategy
-        is already applied this is a no-op.
+        Incremental: components that already have the resolved strategy
+        applied are skipped. Components registered after a previous apply
+        call are picked up automatically. On a strategy *transition*,
+        every component is re-applied under the new strategy.
+
+        Returns the resolved (concrete) strategy name.
         """
         strategy = self.resolve_offload_strategy(device)
 
@@ -242,15 +295,41 @@ class ModelManager:
             if not self._managed_components:
                 self._applied_strategy = strategy
                 return strategy
-            if self._applied_strategy == strategy:
-                return strategy
 
-        self.prepare_strategy_transition(strategy, device)
+        # Strategy transition: clean up old hooks/placement first. After
+        # this, every component is "pending" and will be re-applied below.
+        if self._applied_strategy is not None and self._applied_strategy != strategy:
+            self.prepare_strategy_transition(strategy, device)
+        else:
+            with self._lock:
+                self._applied_strategy = strategy
+
+        with self._lock:
+            pending: list[tuple[str, Any]] = [
+                (name, mod)
+                for name, mod in self._managed_components.items()
+                if self._component_strategies.get(name) != strategy
+            ]
+
+        if not pending:
+            return strategy
+
+        # Deduplicate by module identity: a single nn.Module registered
+        # under multiple names should only be hooked/moved once. Aliased
+        # names still get their per-component strategy state recorded so a
+        # subsequent apply doesn't try to re-process them.
+        seen_ids: set[int] = set()
+        unique: list[tuple[str, Any]] = []
+        aliases: list[str] = []
+        for name, mod in pending:
+            if id(mod) in seen_ids:
+                aliases.append(name)
+                continue
+            seen_ids.add(id(mod))
+            unique.append((name, mod))
 
         if strategy == "no_offload":
-            with self._lock:
-                components = list(self._managed_components.items())
-            for name, mod in components:
+            for name, mod in unique:
                 if hasattr(mod, "to"):
                     mod.to(device)
                     logger.info("no_offload: moved %s to %s", name, device)
@@ -259,9 +338,7 @@ class ModelManager:
             from diffusers.hooks.group_offloading import apply_group_offloading
 
             offload_kwargs = self._group_offload_kwargs(device)
-            with self._lock:
-                components = list(self._managed_components.items())
-            for name, mod in components:
+            for name, mod in unique:
                 try:
                     remove_offload_hooks(mod)
                     apply_group_offloading(mod, **offload_kwargs)
@@ -270,15 +347,19 @@ class ModelManager:
                     logger.warning("Failed to enable group offload for %s: %s", name, e)
 
         elif strategy == "sequential_group_offload":
-            with self._lock:
-                components = list(self._managed_components.items())
-            for name, mod in components:
+            for name, mod in unique:
                 if hasattr(mod, "to"):
                     mod.to("cpu")
-            logger.info("sequential_group_offload: all components on CPU, hooks deferred")
+            logger.info("sequential_group_offload: %d component(s) on CPU, hooks deferred", len(unique))
 
         elif strategy == "model_offload":
-            logger.info("model_offload: all components remain on CPU")
+            logger.info("model_offload: %d component(s) remain on CPU", len(unique))
+
+        with self._lock:
+            for name, _ in unique:
+                self._component_strategies[name] = strategy
+            for name in aliases:
+                self._component_strategies[name] = strategy
 
         return strategy
 
@@ -448,6 +529,7 @@ class ModelManager:
         with self._lock:
             self._component_cache.clear()
             self._managed_components.clear()
+            self._component_strategies.clear()
             self._applied_strategy = None
             self._group_offload_use_stream = False
             self._group_offload_low_cpu_mem = False

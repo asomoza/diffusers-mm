@@ -54,19 +54,87 @@ class TestComponentRegistration:
         mm.register_component("b", DummyModel())
         assert sorted(mm.component_names) == ["a", "b"]
 
-    def test_register_new_component_resets_applied_strategy(self):
-        mm = ModelManager()
-        mm._applied_strategy = "no_offload"
-        mm.register_component("model", DummyModel())
-        assert mm.applied_strategy is None
+    def test_register_new_component_keeps_global_strategy(self):
+        # New behaviour: adding a component does not invalidate already-applied
+        # strategy on existing components. Only the new slot is marked pending.
+        mm = ModelManager(strategy="no_offload")
+        existing = DummyModel()
+        mm.register_component("existing", existing)
+        mm.apply_offload_strategy("cpu")
+        assert mm.applied_strategy == "no_offload"
+        assert mm._component_strategies["existing"] == "no_offload"
 
-    def test_register_same_component_keeps_strategy(self):
-        mm = ModelManager()
+        new = DummyModel()
+        mm.register_component("new", new)
+        # Global state untouched; only the new component is pending.
+        assert mm.applied_strategy == "no_offload"
+        assert mm._component_strategies.get("existing") == "no_offload"
+        assert "new" not in mm._component_strategies
+
+    def test_register_same_component_is_noop(self):
+        mm = ModelManager(strategy="no_offload")
         model = DummyModel()
         mm.register_component("model", model)
-        mm._applied_strategy = "no_offload"
-        mm.register_component("model", model)  # same object
+        mm.apply_offload_strategy("cpu")
+        before = dict(mm._component_strategies)
+        mm.register_component("model", model)  # same name + same module
+        assert mm._component_strategies == before
+
+    def test_register_different_module_under_existing_name_resets_only_that_slot(self):
+        mm = ModelManager(strategy="no_offload")
+        a = DummyModel()
+        b = DummyModel()
+        mm.register_component("a", a)
+        mm.register_component("b", b)
+        mm.apply_offload_strategy("cpu")
+        assert mm._component_strategies == {"a": "no_offload", "b": "no_offload"}
+
+        replacement = DummyModel()
+        mm.register_component("a", replacement)
+        # Only "a" is now pending; "b" keeps its applied state.
+        assert "a" not in mm._component_strategies
+        assert mm._component_strategies["b"] == "no_offload"
         assert mm.applied_strategy == "no_offload"
+
+
+class TestRegisterComponents:
+    def test_from_dict(self):
+        mm = ModelManager()
+        a, b = DummyModel(), DummyModel()
+        registered = mm.register_components({"a": a, "b": b})
+        assert sorted(registered) == ["a", "b"]
+        assert mm.get_component("a") is a
+        assert mm.get_component("b") is b
+
+    def test_from_pipeline_like(self):
+        class FakePipe:
+            def __init__(self):
+                self.components = {"transformer": DummyModel(), "vae": DummyModel(), "scheduler": "not_a_module"}
+
+        mm = ModelManager()
+        pipe = FakePipe()
+        registered = mm.register_components(pipe)
+        # Non-modules are silently skipped.
+        assert sorted(registered) == ["transformer", "vae"]
+        assert mm.get_component("scheduler") is None
+
+    def test_invalid_source_raises(self):
+        mm = ModelManager()
+        with pytest.raises(TypeError, match="register_components expected"):
+            mm.register_components(["not", "a", "dict"])
+
+    def test_shared_module_across_pipelines(self):
+        # Same nn.Module passed under the same name from two "pipelines"
+        # should not cause a strategy reset on the second pass.
+        mm = ModelManager(strategy="no_offload")
+        shared = DummyModel()
+        mm.register_components({"text_encoder": shared})
+        mm.apply_offload_strategy("cpu")
+        before = dict(mm._component_strategies)
+
+        # Second pipeline registers the same shared module under the same name.
+        mm.register_components({"text_encoder": shared})
+        assert mm._component_strategies == before
 
 
 class TestCache:
@@ -157,6 +225,31 @@ class TestApplyStrategyNoOffload:
         mm = ModelManager(strategy="no_offload")
         result = mm.apply_offload_strategy("cpu")
         assert result == "no_offload"
+
+    def test_incremental_apply_only_touches_pending(self):
+        # Applying twice in a row with no new components is a true no-op:
+        # already-marked components are skipped.
+        mm = ModelManager(strategy="no_offload")
+        a, b = DummyModel(), DummyModel()
+        mm.register_component("a", a)
+        mm.apply_offload_strategy("cpu")
+        assert mm._component_strategies == {"a": "no_offload"}
+
+        mm.register_component("b", b)
+        # "a" is already marked; only "b" is pending.
+        mm.apply_offload_strategy("cpu")
+        assert mm._component_strategies == {"a": "no_offload", "b": "no_offload"}
+
+    def test_aliased_module_registered_under_two_names_dedupes(self):
+        # The same nn.Module registered under two names should only be
+        # processed once, but both names should track the applied strategy
+        # so subsequent applies are no-ops.
+        mm = ModelManager(strategy="no_offload")
+        shared = DummyModel()
+        mm.register_component("primary", shared)
+        mm.register_component("alias", shared)
+        mm.apply_offload_strategy("cpu")
+        assert mm._component_strategies == {"primary": "no_offload", "alias": "no_offload"}
 
 
 class TestUseComponentsModelOffload:

@@ -91,3 +91,41 @@ class TestManagedGroupOffloadOptions:
         )
         assert pipe.mm.group_offload_use_stream is True
         assert pipe.mm.group_offload_low_cpu_mem is True
+
+
+class TestManagedSharedManager:
+    def test_two_pipelines_share_manager(self):
+        mm = ModelManager(strategy="model_offload")
+        pipe1 = FakePipeline(transformer=DummyModel(), vae=DummyModel())
+        pipe2 = FakePipeline(transformer=DummyModel(), text_encoder=DummyModel())
+
+        managed(pipe1, mm=mm, device="cpu")
+        managed(pipe2, mm=mm, device="cpu")
+
+        assert pipe1.mm is mm
+        assert pipe2.mm is mm
+        # All four components live in the same registry. pipe2's transformer
+        # replaces pipe1's under the same name (this is the documented limit
+        # — different pipelines with name collisions overwrite).
+        assert sorted(mm.component_names) == ["text_encoder", "transformer", "vae"]
+
+    def test_shared_module_across_pipelines_is_idempotent(self):
+        mm = ModelManager(strategy="no_offload")
+        shared = DummyModel()
+        pipe1 = FakePipeline(text_encoder=shared)
+        managed(pipe1, mm=mm, device="cpu")
+        before = dict(mm._component_strategies)
+
+        # A second pipeline declares the same shared module under the same
+        # name — should be a no-op for strategy state.
+        pipe2 = FakePipeline(text_encoder=shared)
+        managed(pipe2, mm=mm, device="cpu")
+        assert mm._component_strategies == before
+
+    def test_external_mm_ignores_strategy_kwargs(self):
+        # When mm is provided, strategy/use_stream kwargs are not used to
+        # override the manager's existing configuration.
+        mm = ModelManager(strategy="model_offload")
+        pipe = FakePipeline(transformer=DummyModel())
+        managed(pipe, mm=mm, strategy="no_offload", device="cpu")
+        assert mm.offload_strategy == "model_offload"
