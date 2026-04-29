@@ -237,6 +237,70 @@ class TestUnregisterComponent:
         assert m not in cleaned
 
 
+class TestUnloadComponent:
+    def test_returns_false_when_missing(self):
+        mm = ModelManager()
+        assert mm.unload_component("nonexistent") is False
+
+    def test_removes_from_registry_and_cache(self):
+        mm = ModelManager()
+        m = DummyModel()
+        mm.load_component("text_encoder", "id-1", lambda: m)
+        cache_key = ModelManager.component_hash("id-1")
+        assert mm.get_cached(cache_key) is m
+
+        assert mm.unload_component("text_encoder") is True
+        assert mm.get_component("text_encoder") is None
+        assert mm.get_cached(cache_key) is None
+
+    def test_unload_then_load_reruns_factory(self):
+        # Symmetry test: after unload, the next load_component for the
+        # same identifier must call the factory again (cache miss).
+        mm = ModelManager()
+        calls: list[bool] = []
+
+        def factory():
+            calls.append(True)
+            return DummyModel()
+
+        mm.load_component("text_encoder", "id-1", factory)
+        assert len(calls) == 1
+        mm.unload_component("text_encoder")
+        mm.load_component("text_encoder", "id-1", factory)
+        assert len(calls) == 2
+
+    def test_unload_keeps_cache_when_module_still_aliased(self):
+        # If the module is reachable under another name, evicting the
+        # cache would let the next load produce a duplicate of a module
+        # already in the registry. Keep the cache entry.
+        mm = ModelManager()
+        m = DummyModel()
+        mm.load_component("primary", "id-1", lambda: m)
+        mm.load_component("alias", "id-1", lambda: m)
+        cache_key = ModelManager.component_hash("id-1")
+        assert mm.get_cached(cache_key) is m
+
+        mm.unload_component("primary")
+        # "primary" is gone, but the alias still has it AND the cache
+        # is preserved so a future load via the alias's identifier
+        # finds the same module.
+        assert mm.get_component("primary") is None
+        assert mm.get_component("alias") is m
+        assert mm.get_cached(cache_key) is m
+
+    def test_unload_cleans_hooks_for_hooked_strategy(self, monkeypatch):
+        cleaned: list = []
+        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
+
+        mm = ModelManager(strategy="group_offload")
+        m = DummyModel()
+        mm.load_component("transformer", "id-1", lambda: m)
+        mm._component_strategies["transformer"] = "group_offload"
+
+        mm.unload_component("transformer")
+        assert cleaned == [m]
+
+
 class TestRegisterComponents:
     def test_from_dict(self):
         mm = ModelManager()

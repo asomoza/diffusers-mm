@@ -173,7 +173,9 @@ class ModelManager:
         Same orphan-cleanup semantics as ``register_component``: if the
         module had hook-based offloading applied (``group_offload`` /
         ``sequential_group_offload``) and isn't aliased under another name,
-        its hooks are removed before the reference is dropped.
+        its hooks are removed before the reference is dropped. The cache
+        is left intact — use :meth:`unload_component` if you also want to
+        evict the cache entry.
 
         Returns ``True`` if a component was removed, ``False`` if no
         component was registered under *name*.
@@ -185,6 +187,45 @@ class ModelManager:
             self._cleanup_orphan_hooks(name, existing, "unregistered")
             del self._managed_components[name]
             self._component_strategies.pop(name, None)
+            return True
+
+    def unload_component(self, name: str) -> bool:
+        """Symmetric counterpart to :meth:`load_component`.
+
+        Removes *name* from the registry (with the same orphan-hook
+        cleanup as ``unregister_component``) **and** evicts the module
+        from the cache so a subsequent :meth:`load_component` call with
+        the same identifier will re-run its factory.
+
+        The cache eviction is conditional: if the module is still aliased
+        under another registered name, the cache entry is kept so the
+        alias doesn't get out of sync with future ``load_component`` calls
+        (otherwise a future load would miss the cache and produce a
+        duplicate of a module already in the registry).
+
+        The module itself is **not** mutated — no ``.to("cpu")``, no
+        explicit ``del``. The manager only owns references; freeing GPU
+        memory is the caller's responsibility once they drop their own
+        references.
+
+        Returns ``True`` if a component was unloaded, ``False`` if nothing
+        was registered under *name*.
+        """
+        with self._lock:
+            existing = self._managed_components.get(name)
+            if existing is None:
+                return False
+            self._cleanup_orphan_hooks(name, existing, "unloaded")
+            del self._managed_components[name]
+            self._component_strategies.pop(name, None)
+
+            still_aliased = any(other is existing for other in self._managed_components.values())
+            if not still_aliased:
+                evicted = [k for k, v in self._component_cache.items() if v is existing]
+                for k in evicted:
+                    del self._component_cache[k]
+                if evicted:
+                    logger.info("unload_component: evicted %d cache entries for %r", len(evicted), name)
             return True
 
     def register_components(self, source: Any) -> list[str]:
