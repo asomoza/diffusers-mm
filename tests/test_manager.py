@@ -8,6 +8,12 @@ import pytest
 import torch
 from torch import nn
 
+from diffusers_mm.block_pin import (
+    apply_block_pin,
+    find_largest_block_list,
+    non_block_size_bytes,
+    per_block_size_bytes,
+)
 from diffusers_mm.manager import ModelManager, get_device, get_dtype
 
 
@@ -1076,6 +1082,267 @@ class TestRecordMemoryHistory:
         with mm.record_memory_history(str(out)):
             pass
         assert not out.exists()
+
+
+class TestBlockPinHelpers:
+    """Internals of the ``block_pin`` module."""
+
+    def test_find_largest_block_list_picks_largest_by_param_count(self):
+        m = nn.Module()
+        m.small_blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(3)])
+        m.big_blocks = nn.ModuleList([nn.Linear(64, 64) for _ in range(3)])
+        result = find_largest_block_list(m)
+        assert result is not None
+        name, blocks = result
+        assert name == "big_blocks"
+        assert len(blocks) == 3
+
+    def test_find_largest_block_list_skips_short_lists(self):
+        m = nn.Module()
+        m.solo = nn.ModuleList([nn.Linear(4, 4)])
+        assert find_largest_block_list(m) is None
+
+    def test_find_largest_block_list_skips_mixed_types(self):
+        m = nn.Module()
+        m.mixed = nn.ModuleList([nn.Linear(4, 4), nn.Conv2d(3, 3, 3)])
+        assert find_largest_block_list(m) is None
+
+    def test_find_largest_block_list_returns_none_when_no_lists(self):
+        m = nn.Module()
+        m.head = nn.Linear(4, 4)
+        assert find_largest_block_list(m) is None
+
+    def test_per_block_size_bytes(self):
+        # nn.Linear(8, 8) → 8*8 + 8 = 72 params × 4 bytes (float32) = 288 bytes.
+        blocks = nn.ModuleList([nn.Linear(8, 8) for _ in range(3)])
+        assert per_block_size_bytes(blocks) == 288
+
+    def test_per_block_size_bytes_empty_list_returns_zero(self):
+        assert per_block_size_bytes(nn.ModuleList()) == 0
+
+    def test_non_block_size_bytes_includes_top_level_param(self):
+        # Per the LTX-2 ``scale_shift_table`` case: a direct nn.Parameter
+        # on the component (not inside any child) must be counted.
+        m = nn.Module()
+        m.head = nn.Linear(4, 4)  # 4*4 + 4 = 20 params, 80 bytes
+        m.blocks = nn.ModuleList([nn.Linear(8, 8) for _ in range(3)])
+        m.scale = nn.Parameter(torch.zeros(10))  # 10 params, 40 bytes
+        assert non_block_size_bytes(m, "blocks") == 80 + 40
+
+    def test_apply_block_pin_clamps_num_to_pin_and_runs_cpu_to_cpu(self):
+        # CPU-only smoke test: pinning is a no-op move on CPU but the
+        # function should still walk every code path (children, top-level
+        # params/buffers, blocks) without raising. ``num_to_pin > len`` is
+        # clamped to len(blocks). num_to_pin = len so no overflow → we
+        # don't need diffusers in this test.
+        m = nn.Module()
+        m.head = nn.Linear(4, 4)
+        m.blocks = nn.ModuleList([nn.Linear(8, 8) for _ in range(3)])
+        m.scale = nn.Parameter(torch.zeros(10))
+        m.register_buffer("buf", torch.zeros(5))
+
+        applied = apply_block_pin(
+            m,
+            "blocks",
+            m.blocks,
+            num_to_pin=99,  # over-large → clamps to 3
+            device=torch.device("cpu"),
+            offload_kwargs={},  # not consulted when no overflow
+        )
+        assert applied == 3
+
+
+class TestBlockPinCount:
+    """``_compute_block_pin_count`` budget logic."""
+
+    def test_override_clamped_to_block_count(self):
+        mm = ModelManager()
+        mm.set_block_pin_count("transformer", 100)
+        m = nn.Module()
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(8)])
+        n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cpu")
+        assert n == 8  # clamped to len(blocks)
+
+    def test_override_zero_pins_nothing(self):
+        mm = ModelManager()
+        mm.set_block_pin_count("transformer", 0)
+        m = nn.Module()
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(8)])
+        n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cpu")
+        assert n == 0
+
+    def test_set_block_pin_count_negative_raises(self):
+        mm = ModelManager()
+        with pytest.raises(ValueError, match=">= 0"):
+            mm.set_block_pin_count("transformer", -1)
+
+    def test_auto_count_uses_vram_budget(self, monkeypatch):
+        # 12 GB VRAM, 0.5 GB non-block, 6 GB working set = 5.5 GB budget.
+        # Per-block size = 1 GB → 5 blocks fit.
+        _patch_vram(monkeypatch, 12.0)
+        mm = ModelManager()
+        # Stub the size helpers — actually allocating GB of params is not
+        # an option here.
+        monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(1.0 * 1024**3))
+        monkeypatch.setattr("diffusers_mm.manager.non_block_size_bytes", lambda c, a: int(0.5 * 1024**3))
+        m = nn.Module()
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(20)])
+        n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
+        assert n == 5
+
+    def test_auto_count_returns_zero_when_no_budget(self, monkeypatch, caplog):
+        # 6 GB VRAM, 6 GB non-block → budget = 6 - 6 - 6 = -6 → 0 pinned.
+        _patch_vram(monkeypatch, 6.0)
+        mm = ModelManager()
+        monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(1.0 * 1024**3))
+        monkeypatch.setattr("diffusers_mm.manager.non_block_size_bytes", lambda c, a: int(6.0 * 1024**3))
+        m = nn.Module()
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(20)])
+        with caplog.at_level("WARNING"):
+            n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
+        assert n == 0
+        assert any("no VRAM budget" in r.message for r in caplog.records)
+
+    def test_auto_count_clamped_to_block_count(self, monkeypatch):
+        # Huge budget but only 4 blocks exist.
+        _patch_vram(monkeypatch, 1000.0)
+        mm = ModelManager()
+        monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(0.001 * 1024**3))
+        monkeypatch.setattr("diffusers_mm.manager.non_block_size_bytes", lambda c, a: 0)
+        m = nn.Module()
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(4)])
+        n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
+        assert n == 4
+
+
+class TestAutoResolutionPicksBlockPin:
+    """Auto resolver should prefer block_pin over group_offload when
+    the largest component has a long enough block list."""
+
+    def _make_with_blocks(self, num_blocks: int = 16) -> nn.Module:
+        m = nn.Module()
+        m.head = nn.Linear(4, 4)
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(num_blocks)])
+        return m
+
+    def test_picks_block_pin_when_largest_has_block_list(self, monkeypatch):
+        # 12 GB VRAM, largest component 10 GB (×1.5 = 15 > 12 → can't
+        # model_offload), but it has 16 blocks → block_pin.
+        _patch_vram(monkeypatch, 12.0)
+        mm = ModelManager(strategy="auto")
+        mm._estimate_components_size_gb = lambda: (15.0, 10.0)
+        mm.register_component("transformer", self._make_with_blocks(num_blocks=16))
+        assert mm.resolve_offload_strategy("cuda") == "block_pin"
+
+    def test_falls_back_to_group_offload_when_no_block_list(self, monkeypatch):
+        _patch_vram(monkeypatch, 12.0)
+        mm = ModelManager(strategy="auto")
+        mm._estimate_components_size_gb = lambda: (15.0, 10.0)
+        # Plain DummyModel — no block list discoverable.
+        mm.register_component("transformer", DummyModel())
+        assert mm.resolve_offload_strategy("cuda") == "group_offload"
+
+    def test_falls_back_when_block_list_too_short(self, monkeypatch):
+        # AUTO_BLOCK_PIN_MIN_BLOCKS = 8 by default. 4 blocks → too few.
+        _patch_vram(monkeypatch, 12.0)
+        mm = ModelManager(strategy="auto")
+        mm._estimate_components_size_gb = lambda: (15.0, 10.0)
+        mm.register_component("transformer", self._make_with_blocks(num_blocks=4))
+        assert mm.resolve_offload_strategy("cuda") == "group_offload"
+
+    def test_block_pin_skipped_when_model_offload_fits(self, monkeypatch):
+        # 24 GB VRAM, largest 10 GB → 10 × 1.5 = 15 ≤ 24 → model_offload
+        # wins even though a block list exists.
+        _patch_vram(monkeypatch, 24.0)
+        mm = ModelManager(strategy="auto")
+        mm._estimate_components_size_gb = lambda: (20.0, 10.0)
+        mm.register_component("transformer", self._make_with_blocks(num_blocks=16))
+        assert mm.resolve_offload_strategy("cuda") == "model_offload"
+
+    def test_block_pin_triggers_low_cpu_mem_auto_tune(self, monkeypatch):
+        # Confirm the auto-tune of low_cpu_mem_usage runs for block_pin
+        # (same RAM-headroom heuristic as group_offload).
+        _patch_vram(monkeypatch, 12.0)
+        mm = ModelManager(strategy="auto")
+        mm._estimate_components_size_gb = lambda: (15.0, 10.0)
+        mm._detect_available_ram_gb = lambda: (128.0, 128.0)
+        mm.register_component("transformer", self._make_with_blocks(num_blocks=16))
+        assert mm.group_offload_low_cpu_mem is True
+
+        chosen = mm.resolve_offload_strategy("cuda")
+        assert chosen == "block_pin"
+        assert mm.group_offload_low_cpu_mem is False
+
+
+class TestApplyBlockPinStrategy:
+    """End-to-end: apply_offload_strategy with block_pin and a fake apply_group_offloading."""
+
+    def test_apply_block_pin_pins_and_streams_overflow(self, monkeypatch):
+        # Stub apply_group_offloading so we don't need a real CUDA setup,
+        # and capture which blocks it gets called on. With num_to_pin=3
+        # out of 5 blocks, we should see exactly 2 streaming calls.
+        streamed: list = []
+
+        def fake_apply(mod, **kwargs):
+            streamed.append(mod)
+
+        monkeypatch.setattr("diffusers.hooks.group_offloading.apply_group_offloading", fake_apply)
+
+        # Force the override so we don't depend on VRAM detection.
+        mm = ModelManager(strategy="block_pin")
+        m = nn.Module()
+        m.head = nn.Linear(4, 4)
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(5)])
+        mm.register_component("transformer", m)
+        mm.set_block_pin_count("transformer", 3)
+
+        mm.apply_offload_strategy("cpu")
+
+        assert mm.applied_strategy == "block_pin"
+        # Two overflow blocks streamed, and the per-block call gets the
+        # block module (not the whole transformer).
+        assert len(streamed) == 2
+        assert streamed[0] is m.blocks[3]
+        assert streamed[1] is m.blocks[4]
+
+    def test_apply_block_pin_falls_back_to_group_offload_without_block_list(self, monkeypatch):
+        # A component with no discoverable block list should get plain
+        # group_offload at apply time — we expect exactly one call on
+        # the whole component.
+        called_with: list = []
+
+        def fake_apply(mod, **kwargs):
+            called_with.append(mod)
+
+        monkeypatch.setattr("diffusers.hooks.group_offloading.apply_group_offloading", fake_apply)
+
+        mm = ModelManager(strategy="block_pin")
+        m = DummyModel()  # no nn.ModuleList anywhere
+        mm.register_component("text_encoder", m)
+
+        mm.apply_offload_strategy("cpu")
+        assert mm.applied_strategy == "block_pin"
+        assert called_with == [m]
+
+
+class TestBlockPinTransition:
+    """``prepare_strategy_transition`` must clean up block_pin's hooks
+    on its way out, the same way it does for group_offload."""
+
+    def test_transition_from_block_pin_strips_hooks(self, monkeypatch):
+        cleaned: list = []
+        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
+
+        mm = ModelManager(strategy="block_pin")
+        m = DummyModel()
+        mm.register_component("transformer", m)
+        # Pretend block_pin was applied.
+        mm._applied_strategy = "block_pin"
+        mm._component_strategies["transformer"] = "block_pin"
+
+        mm.prepare_strategy_transition("no_offload", "cpu")
+        assert m in cleaned
+        assert mm.applied_strategy == "no_offload"
 
 
 class TestThreadSafety:

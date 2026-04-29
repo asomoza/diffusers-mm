@@ -15,12 +15,18 @@ from typing import Any
 import torch
 from torch import nn
 
+from diffusers_mm.block_pin import (
+    apply_block_pin,
+    find_largest_block_list,
+    non_block_size_bytes,
+    per_block_size_bytes,
+)
 from diffusers_mm.hooks import remove_offload_hooks
 
 
 logger = logging.getLogger(__name__)
 
-OFFLOAD_STRATEGIES = ("auto", "no_offload", "model_offload", "group_offload")
+OFFLOAD_STRATEGIES = ("auto", "no_offload", "model_offload", "group_offload", "block_pin")
 
 _SCOPED_DEVICE: contextvars.ContextVar[torch.device | None] = contextvars.ContextVar(
     "diffusers_mm_scoped_device", default=None
@@ -70,6 +76,17 @@ class ModelManager:
     # is mmap'd (originals may or may not be resident, and pages get
     # evicted as needed). Default 16 GB is comfortable for most setups.
     AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB = 16.0
+    # Block-pin auto-budget: when computing the optimal ``num_to_pin`` per
+    # component, reserve this much VRAM for the streaming overflow's
+    # working set (pinned host buffers in flight + activations + per-step
+    # peaks). Empirically ~5 GiB on LTX-2.3 at 768x512x121f; round to 6
+    # for safety. Override per-component via ``set_block_pin_count`` if
+    # this heuristic is wrong for your workload.
+    AUTO_BLOCK_PIN_WORKING_SET_GB = 6.0
+    # Don't bother with block_pin if the discoverable block list is
+    # smaller than this — the overhead of per-block apply_group_offloading
+    # outweighs the benefit when there are only a handful of blocks.
+    AUTO_BLOCK_PIN_MIN_BLOCKS = 8
 
     def __init__(
         self,
@@ -112,6 +129,10 @@ class ModelManager:
         # that stays on GPU after the chain's final forward) — diffusers
         # exposes this on the pipeline as ``final_offload_hook``.
         self._model_offload_final_hook: Any = None
+        # Per-component overrides for ``block_pin``: name → number of blocks
+        # to pin on GPU. Names absent from this dict get auto-computed from
+        # the available VRAM at apply time.
+        self._block_pin_counts: dict[str, int] = {}
         self._applied_strategy: str | None = None
 
         self._offload_strategy: str = "auto"
@@ -632,6 +653,14 @@ class ModelManager:
             chosen = "no_offload"
         elif max_component_gb * self.AUTO_MODEL_OFFLOAD_FACTOR <= vram_avail_gb:
             chosen = "model_offload"
+        elif self._largest_component_has_block_list():
+            # Largest component (typically the transformer) won't fit
+            # under model_offload, but it has a long enough repeated-block
+            # list to do better than plain leaf-level streaming: pin as
+            # many blocks as VRAM allows, stream the rest. Components
+            # without a block list fall back to plain group_offload at
+            # apply time, so this is safe even in mixed pipelines.
+            chosen = "block_pin"
         else:
             chosen = "group_offload"
 
@@ -649,7 +678,9 @@ class ModelManager:
         # Once the strategy is picked, also auto-tune any of its knobs
         # we can sensibly derive from the same hardware picture. The user
         # opted into "auto" → they want the manager to manage all of it.
-        if chosen == "group_offload":
+        # block_pin uses the same group_offload kwargs for its overflow
+        # streaming, so the same RAM-headroom heuristic applies.
+        if chosen in ("group_offload", "block_pin"):
             self._auto_tune_group_offload(weights_gb, ram_avail_gb)
 
         return chosen
@@ -696,6 +727,124 @@ class ModelManager:
                 slack_gb,
             )
 
+    # ------------------------------------------------------------------
+    # Block-pin (selective offload) — public override + auto budget
+    # ------------------------------------------------------------------
+
+    def set_block_pin_count(self, component_name: str, count: int) -> None:
+        """Override the number of blocks to pin on GPU for *component_name*.
+
+        Used only when the active strategy is ``"block_pin"``. Names without
+        an override get an auto-computed value from available VRAM at apply
+        time. ``count=0`` is valid — it means "pin nothing for this
+        component, just stream it" (effectively per-block ``group_offload``).
+        """
+        if int(count) < 0:
+            raise ValueError("block_pin count must be >= 0")
+        with self._lock:
+            self._block_pin_counts[component_name] = int(count)
+
+    def _compute_block_pin_count(
+        self,
+        component_name: str,
+        component: Any,
+        block_attr: str,
+        blocks: Any,
+        device: torch.device | str,
+    ) -> int:
+        """Auto-compute the number of blocks to pin for *component*.
+
+        If the user has set an override via ``set_block_pin_count``, that
+        wins (clamped to ``[0, len(blocks)]``). Otherwise: take available
+        VRAM, subtract the component's non-block size and a working-set
+        safety margin, divide by per-block size.
+        """
+        with self._lock:
+            override = self._block_pin_counts.get(component_name)
+        if override is not None:
+            return max(0, min(override, len(blocks)))
+
+        per_block = per_block_size_bytes(blocks)
+        if per_block <= 0:
+            return 0
+        per_block_gb = per_block / (1024**3)
+
+        vram_avail_gb, _ = self._detect_available_vram_gb(device)
+        non_block_gb = non_block_size_bytes(component, block_attr) / (1024**3)
+
+        budget_gb = vram_avail_gb - non_block_gb - self.AUTO_BLOCK_PIN_WORKING_SET_GB
+        if budget_gb <= 0:
+            logger.warning(
+                "block_pin: %s — no VRAM budget for pinning (avail=%.1f, non_block=%.1f, "
+                "working_set=%.1f) → 0 pinned, all blocks stream",
+                component_name,
+                vram_avail_gb,
+                non_block_gb,
+                self.AUTO_BLOCK_PIN_WORKING_SET_GB,
+            )
+            return 0
+
+        n = int(budget_gb / per_block_gb)
+        n = max(0, min(n, len(blocks)))
+        return n
+
+    @staticmethod
+    def _maybe_warn_expandable_segments() -> None:
+        """Hint about ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``.
+
+        Block-pin tightly budgets VRAM (pinned blocks + non-block parts +
+        a working-set margin). Without ``expandable_segments``, allocator
+        fragmentation can swallow 1–2 GiB and turn a careful budget into
+        an OOM. Logged as a one-time hint when the strategy is applied.
+        """
+        import os
+
+        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if "expandable_segments:True" not in conf:
+            logger.warning(
+                "block_pin: PYTORCH_CUDA_ALLOC_CONF does not include "
+                "'expandable_segments:True'. Allocator fragmentation may "
+                "consume ~1-2 GiB and cause OOM. Recommended: set "
+                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before "
+                "starting Python."
+            )
+
+    def _largest_component_has_block_list(self) -> bool:
+        """True if the largest registered component has a usable block list.
+
+        "Usable" = at least :attr:`AUTO_BLOCK_PIN_MIN_BLOCKS` entries.
+        Below that threshold, per-block ``apply_group_offloading``
+        overhead outweighs the benefit and plain ``group_offload`` is
+        a better default.
+        """
+        with self._lock:
+            components = list(self._managed_components.values())
+        if not components:
+            return False
+
+        seen_ids: set[int] = set()
+        largest: nn.Module | None = None
+        largest_size = 0
+        for mod in components:
+            if id(mod) in seen_ids:
+                continue
+            seen_ids.add(id(mod))
+            try:
+                size = sum(p.numel() * p.element_size() for p in mod.parameters())
+            except Exception:
+                continue
+            if size > largest_size:
+                largest_size = size
+                largest = mod
+        if largest is None:
+            return False
+
+        result = find_largest_block_list(largest)
+        if result is None:
+            return False
+        _, blocks = result
+        return len(blocks) >= self.AUTO_BLOCK_PIN_MIN_BLOCKS
+
     def prepare_strategy_transition(self, new_strategy: str, device: torch.device | str) -> None:
         """Clean up the old offload strategy before applying *new_strategy*.
 
@@ -705,7 +854,8 @@ class ModelManager:
         component will be re-applied under the new strategy.
 
         Hook-based strategies (``group_offload`` via diffusers hooks,
-        ``model_offload`` via accelerate hooks) all have their hooks
+        ``model_offload`` via accelerate hooks, ``block_pin`` via per-block
+        diffusers hooks on the overflow blocks) all have their hooks
         stripped via ``remove_offload_hooks`` (which handles both flavors).
         Then every component is moved back to CPU so the next strategy
         starts from a clean state.
@@ -715,7 +865,7 @@ class ModelManager:
             if old == new_strategy:
                 return
 
-            hook_based = old in ("group_offload", "model_offload")
+            hook_based = old in ("group_offload", "model_offload", "block_pin")
 
             seen_ids: set[int] = set()
             for name, mod in self._managed_components.items():
@@ -846,6 +996,55 @@ class ModelManager:
         elif strategy == "model_offload":
             self._install_model_offload_chain(device)
 
+        elif strategy == "block_pin":
+            from diffusers.hooks.group_offloading import apply_group_offloading
+
+            self._maybe_warn_expandable_segments()
+            offload_kwargs = self._group_offload_kwargs(device)
+            logger.info(
+                "block_pin: overflow streaming kwargs use_stream=%s, low_cpu_mem_usage=%s",
+                offload_kwargs.get("use_stream"),
+                offload_kwargs.get("low_cpu_mem_usage", "absent"),
+            )
+            device_obj = torch.device(device) if isinstance(device, str) else device
+            for name, mod in unique:
+                # Pre-clean any prior hooks so re-applying is safe (idempotent).
+                remove_offload_hooks(mod)
+                result = find_largest_block_list(mod)
+                if result is None:
+                    # No discoverable repeated-block list — fall back to
+                    # plain leaf-level group offload for this component.
+                    try:
+                        apply_group_offloading(mod, **offload_kwargs)
+                        logger.info(
+                            "block_pin: %s has no block list, fell back to group_offload",
+                            name,
+                        )
+                    except Exception as e:
+                        logger.warning("block_pin: group_offload fallback failed for %s: %s", name, e)
+                    continue
+                block_attr, blocks = result
+                n = self._compute_block_pin_count(name, mod, block_attr, blocks, device)
+                try:
+                    applied_n = apply_block_pin(
+                        mod,
+                        block_attr,
+                        blocks,
+                        n,
+                        device_obj,
+                        offload_kwargs=offload_kwargs,
+                    )
+                    logger.info(
+                        "block_pin: %s — pinned %d/%d %s blocks, streaming %d",
+                        name,
+                        applied_n,
+                        len(blocks),
+                        block_attr,
+                        len(blocks) - applied_n,
+                    )
+                except Exception as e:
+                    logger.warning("block_pin: failed for %s: %s", name, e)
+
         with self._lock:
             for name, _ in unique:
                 self._component_strategies[name] = strategy
@@ -933,9 +1132,10 @@ class ModelManager:
 
         Behaviour depends on the active offload strategy:
 
-        - ``no_offload`` / ``group_offload``: no-op yield (placement is
-          already correct — components are on GPU permanently for
-          no_offload, or have hooks for group_offload).
+        - ``no_offload`` / ``group_offload`` / ``block_pin``: no-op yield
+          (placement is already correct — components are on GPU permanently
+          for no_offload, have hooks for group_offload, or have a mix of
+          pinned blocks + per-block hooks for block_pin).
         - ``model_offload``: bulk CPU → GPU move on enter, back to CPU on
           exit. Mostly relevant for **decomposed** pipeline workflows;
           monolithic ``pipe(...)`` calls already work correctly under
@@ -950,7 +1150,7 @@ class ModelManager:
         if strategy_override is not None:
             strategy = strategy_override
 
-        if strategy in ("no_offload", "group_offload"):
+        if strategy in ("no_offload", "group_offload", "block_pin"):
             yield
             return
 
