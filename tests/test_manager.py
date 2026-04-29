@@ -97,6 +97,73 @@ class TestComponentRegistration:
         assert mm.applied_strategy == "no_offload"
 
 
+class TestDisplacedModuleHookCleanup:
+    """Replacing a module under an existing name shouldn't orphan its hooks."""
+
+    def test_displacing_hooked_module_removes_hooks(self, monkeypatch):
+        cleaned: list = []
+        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
+
+        mm = ModelManager(strategy="group_offload")
+        old = DummyModel()
+        mm.register_component("transformer", old)
+        # Simulate post-apply state without going through real diffusers hooks
+        # (which need CUDA): we just claim the strategy was applied.
+        mm._component_strategies["transformer"] = "group_offload"
+
+        new = DummyModel()
+        mm.register_component("transformer", new)
+
+        assert cleaned == [old]
+
+    def test_displacing_aliased_module_leaves_hooks_intact(self, monkeypatch):
+        # The displaced module is still reachable via another name in the
+        # registry, so its hooks are still meaningful — don't clean them up.
+        cleaned: list = []
+        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
+
+        mm = ModelManager(strategy="group_offload")
+        shared = DummyModel()
+        mm.register_component("primary", shared)
+        mm.register_component("alias", shared)
+        mm._component_strategies = {"primary": "group_offload", "alias": "group_offload"}
+
+        new = DummyModel()
+        mm.register_component("primary", new)
+
+        assert shared not in cleaned
+
+    def test_displacing_under_non_hook_strategy_does_not_call_remove(self, monkeypatch):
+        cleaned: list = []
+        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
+
+        mm = ModelManager(strategy="no_offload")
+        old = DummyModel()
+        mm.register_component("model", old)
+        mm.apply_offload_strategy("cpu")
+        assert mm._component_strategies["model"] == "no_offload"
+
+        new = DummyModel()
+        mm.register_component("model", new)
+
+        assert old not in cleaned
+
+    def test_displacing_unhooked_pending_module_does_not_call_remove(self, monkeypatch):
+        # Module was registered but apply was never run — strategy state is
+        # absent for that slot, so nothing to clean up.
+        cleaned: list = []
+        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
+
+        mm = ModelManager(strategy="group_offload")
+        old = DummyModel()
+        mm.register_component("transformer", old)
+        # Note: no apply, so _component_strategies is empty.
+        new = DummyModel()
+        mm.register_component("transformer", new)
+
+        assert old not in cleaned
+
+
 class TestRegisterComponents:
     def test_from_dict(self):
         mm = ModelManager()

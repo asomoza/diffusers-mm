@@ -120,10 +120,16 @@ class ModelManager:
         when a pipeline is recreated against the same long-lived manager
         and re-declares its components.
 
-        Re-registering a *different* module under an existing name marks
-        that slot as needing strategy re-application on the next
-        ``apply_offload_strategy`` call. The global applied-strategy state
-        is left untouched so that other components keep their hooks.
+        Re-registering a *different* module under an existing name displaces
+        the previous module. If that displaced module had hook-based
+        offloading applied (``group_offload`` / ``sequential_group_offload``)
+        and isn't aliased under another name in the registry, its hooks are
+        removed before the reference is dropped — otherwise the registry
+        would silently leak hooks attached to a module it can no longer
+        clean up. Per-component strategy state for *name* is reset so the
+        new module gets re-hooked on the next ``apply_offload_strategy``
+        call. The global applied-strategy state is left untouched so other
+        components keep their hooks.
 
         Adding a brand-new name leaves the slot pending: only the new
         component will be touched on the next apply call.
@@ -132,6 +138,25 @@ class ModelManager:
             existing = self._managed_components.get(name)
             if existing is module:
                 return
+
+            if existing is not None:
+                old_strategy = self._component_strategies.get(name)
+                if old_strategy in ("group_offload", "sequential_group_offload"):
+                    still_aliased = any(
+                        other_name != name and other_module is existing
+                        for other_name, other_module in self._managed_components.items()
+                    )
+                    if not still_aliased:
+                        try:
+                            remove_offload_hooks(existing)
+                            logger.info(
+                                "Cleaned offload hooks on displaced module under name %r (was %s)",
+                                name,
+                                old_strategy,
+                            )
+                        except Exception as e:
+                            logger.warning("Failed to clean hooks on displaced module under %r: %s", name, e)
+
             self._managed_components[name] = module
             self._component_strategies.pop(name, None)
 
