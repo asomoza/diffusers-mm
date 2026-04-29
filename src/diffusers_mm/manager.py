@@ -61,6 +61,19 @@ class ModelManager:
         # call. Cleared wholesale on a strategy *transition* so every
         # component gets re-applied under the new regime.
         self._component_strategies: dict[str, str] = {}
+        # Refcount keyed by id(module). Every register_component call
+        # increments; every unregister_component call decrements. Cleanup
+        # (hooks, cache, slot deletion) only happens when a module's
+        # refcount hits 0 — this is what lets shared modules across
+        # multiple pipelines stay alive while any consumer still needs them.
+        self._refcount: dict[int, int] = {}
+        # Per-source registration record, keyed by id(source). Stores the
+        # exact (name, module) pairs each source registered via
+        # register_components, so unregister_components can decrement
+        # precisely without needing the user to re-list. Idempotency for
+        # bulk register/unregister also lives here: a second
+        # register_components on the same source is a no-op.
+        self._source_registrations: dict[int, dict[str, Any]] = {}
         self._applied_strategy: str | None = None
 
         self._offload_strategy: str = "auto"
@@ -113,127 +126,130 @@ class ModelManager:
     # Component registration
     # ------------------------------------------------------------------
 
-    def _cleanup_orphan_hooks(self, name: str, module: Any, action: str) -> None:
-        """Remove hook-based offload state from *module* if it's about to be orphaned.
+    def _decrement_module_refcount(self, module: Any, *, slot_name_to_skip: str | None = None) -> None:
+        """Decrement *module*'s refcount. If it reaches zero, fully clean up.
 
-        Caller must hold ``self._lock``. Acts only when the slot's prior
-        strategy was ``group_offload`` / ``sequential_group_offload`` *and*
-        *module* is no longer reachable under any other name in the
-        registry. *action* is just for the log line ("displaced" /
-        "unregistered").
+        Caller must hold ``self._lock``. "Fully clean up" means: remove
+        offload hooks (idempotent — safe even if no hooks were installed),
+        evict any cache entries pointing at the module, and delete every
+        slot in ``_managed_components`` that still points to the module.
+
+        *slot_name_to_skip* lets the displacement path in
+        ``register_component`` reuse the slot it's about to reassign — we
+        don't want to delete the slot only to immediately set it to the
+        new module.
         """
-        old_strategy = self._component_strategies.get(name)
-        if old_strategy not in ("group_offload", "sequential_group_offload"):
+        rc = self._refcount.get(id(module), 0) - 1
+        if rc > 0:
+            self._refcount[id(module)] = rc
             return
-        still_aliased = any(
-            other_name != name and other_module is module
-            for other_name, other_module in self._managed_components.items()
-        )
-        if still_aliased:
-            return
+        # Last reference — clean up.
+        self._refcount.pop(id(module), None)
         try:
             remove_offload_hooks(module)
-            logger.info("Cleaned offload hooks on %s module %r (was %s)", action, name, old_strategy)
         except Exception as e:
-            logger.warning("Failed to clean hooks on %s %r: %s", action, name, e)
+            logger.warning("Failed to remove offload hooks during refcount cleanup: %s", e)
+        # Delete every slot that still points at this module (covers
+        # aliases). Skip the slot the caller is about to reassign.
+        orphan_names = [n for n, m in self._managed_components.items() if m is module and n != slot_name_to_skip]
+        for n in orphan_names:
+            del self._managed_components[n]
+            self._component_strategies.pop(n, None)
+        # Evict cache entries pointing at this module.
+        cache_keys = [k for k, v in self._component_cache.items() if v is module]
+        for k in cache_keys:
+            del self._component_cache[k]
+        if orphan_names or cache_keys:
+            logger.info(
+                "Refcount cleanup: removed %d orphan slot(s), evicted %d cache entr%s",
+                len(orphan_names),
+                len(cache_keys),
+                "y" if len(cache_keys) == 1 else "ies",
+            )
 
     def register_component(self, name: str, module: Any) -> None:
-        """Register a named nn.Module component for lifecycle management.
+        """Register a named ``nn.Module`` component for lifecycle management.
 
-        Re-registering the same ``(name, module)`` pair is a no-op — useful
-        when a pipeline is recreated against the same long-lived manager
-        and re-declares its components.
+        **Each call increments the module's refcount** — register_component
+        is *not* idempotent. Two registrations of the same module (whether
+        under the same name from two sources, or under different names from
+        one source) raise the refcount to 2; the module won't be cleaned
+        up until both registrations are matched by ``unregister_component``
+        calls (or via ``unregister_components(source)``).
 
-        Re-registering a *different* module under an existing name displaces
-        the previous module. If that displaced module had hook-based
-        offloading applied (``group_offload`` / ``sequential_group_offload``)
-        and isn't aliased under another name in the registry, its hooks are
-        removed before the reference is dropped — otherwise the registry
-        would silently leak hooks attached to a module it can no longer
-        clean up. Per-component strategy state for *name* is reset so the
-        new module gets re-hooked on the next ``apply_offload_strategy``
-        call. The global applied-strategy state is left untouched so other
-        components keep their hooks.
+        For pipeline-level idempotency — i.e. calling ``managed(pipe)``
+        twice on the same pipe should not double-count — use the bulk
+        :meth:`register_components` API which dedupes by source identity.
 
-        Adding a brand-new name leaves the slot pending: only the new
-        component will be touched on the next apply call.
+        If a *different* module is registered under an existing name, the
+        previous module's refcount is decremented (potentially triggering
+        full cleanup if it was that module's last registration). The slot
+        is then reassigned to the new module and its per-component strategy
+        state is reset so the new module gets re-hooked on the next
+        ``apply_offload_strategy`` call. Other components are left alone.
         """
         with self._lock:
             existing = self._managed_components.get(name)
-            if existing is module:
-                return
-            if existing is not None:
-                self._cleanup_orphan_hooks(name, existing, "displaced")
-            self._managed_components[name] = module
-            self._component_strategies.pop(name, None)
+            if existing is not module:
+                if existing is not None:
+                    self._decrement_module_refcount(existing, slot_name_to_skip=name)
+                self._managed_components[name] = module
+                self._component_strategies.pop(name, None)
+            self._refcount[id(module)] = self._refcount.get(id(module), 0) + 1
 
     def unregister_component(self, name: str) -> bool:
-        """Remove *name* from the registry.
+        """Decrement the refcount of the module at *name*.
 
-        Same orphan-cleanup semantics as ``register_component``: if the
-        module had hook-based offloading applied (``group_offload`` /
-        ``sequential_group_offload``) and isn't aliased under another name,
-        its hooks are removed before the reference is dropped. The cache
-        is left intact — use :meth:`unload_component` if you also want to
-        evict the cache entry.
+        - If the resulting refcount is still > 0, the slot **stays** in the
+          registry and no cleanup runs (some other consumer — another
+          source, another alias — still needs the module). This is what
+          makes shared components across multiple pipelines work: pipe1
+          unregistering its T5 doesn't yank T5 out from under pipe2.
+        - If the refcount hits 0, the module is fully cleaned up (hooks
+          removed, cache evicted, all slots pointing to it deleted).
 
-        Returns ``True`` if a component was removed, ``False`` if no
-        component was registered under *name*.
+        Returns ``True`` if a registration was found and decremented,
+        ``False`` if nothing was registered under *name*.
         """
         with self._lock:
             existing = self._managed_components.get(name)
             if existing is None:
                 return False
-            self._cleanup_orphan_hooks(name, existing, "unregistered")
-            del self._managed_components[name]
-            self._component_strategies.pop(name, None)
+            self._decrement_module_refcount(existing)
             return True
 
     def unload_component(self, name: str) -> bool:
         """Symmetric counterpart to :meth:`load_component`.
 
-        Removes *name* from the registry (with the same orphan-hook
-        cleanup as ``unregister_component``) **and** evicts the module
-        from the cache so a subsequent :meth:`load_component` call with
-        the same identifier will re-run its factory.
-
-        The cache eviction is conditional: if the module is still aliased
-        under another registered name, the cache entry is kept so the
-        alias doesn't get out of sync with future ``load_component`` calls
-        (otherwise a future load would miss the cache and produce a
-        duplicate of a module already in the registry).
-
-        The module itself is **not** mutated — no ``.to("cpu")``, no
-        explicit ``del``. The manager only owns references; freeing GPU
-        memory is the caller's responsibility once they drop their own
-        references.
-
-        Returns ``True`` if a component was unloaded, ``False`` if nothing
-        was registered under *name*.
+        With refcount-based lifecycle management, this is equivalent to
+        :meth:`unregister_component` — cache eviction is automatic when
+        the module's refcount hits 0. Kept as a distinct entry point for
+        symmetry with ``load_component``.
         """
-        with self._lock:
-            existing = self._managed_components.get(name)
-            if existing is None:
-                return False
-            self._cleanup_orphan_hooks(name, existing, "unloaded")
-            del self._managed_components[name]
-            self._component_strategies.pop(name, None)
-
-            still_aliased = any(other is existing for other in self._managed_components.values())
-            if not still_aliased:
-                evicted = [k for k, v in self._component_cache.items() if v is existing]
-                for k in evicted:
-                    del self._component_cache[k]
-                if evicted:
-                    logger.info("unload_component: evicted %d cache entries for %r", len(evicted), name)
-            return True
+        return self.unregister_component(name)
 
     def register_components(self, source: Any) -> list[str]:
-        """Register every ``nn.Module`` exposed by *source*.
+        """Bulk-register every ``nn.Module`` exposed by *source*.
 
-        *source* may be a ``DiffusionPipeline``-like object that exposes a
-        ``components`` dict, or a plain ``dict[str, nn.Module]``. Returns
-        the list of names that were registered (skipping non-modules).
+        *source* may be a ``DiffusionPipeline``-like object exposing a
+        ``components`` dict, or a plain ``dict[str, nn.Module]``.
+
+        Idempotent per source: if the same *source* is registered twice,
+        the second call is a no-op (returns the names from the prior
+        registration without incrementing refcounts again). This is what
+        makes ``managed(pipe)`` safe to call repeatedly on the same pipe.
+
+        Sources are tracked by ``id(source)``. If the user lets *source*
+        go out of scope without calling :meth:`unregister_components`, the
+        per-source record sticks around (small leak — there's no weakref
+        auto-cleanup yet). Modules registered through that source stay
+        with refcount > 0 and won't be released. Best practice: call
+        ``unregister_components(source)`` (or ``unload_components``) when
+        you're done with a pipeline.
+
+        Returns the list of names that were registered (or, on a repeat
+        call, the names from the prior registration). Non-modules in the
+        components dict are silently skipped.
         """
         if isinstance(source, dict):
             components = source
@@ -244,12 +260,66 @@ class ModelManager:
                 f"register_components expected a pipeline (with .components) or a dict, got {type(source).__name__}"
             )
 
-        registered: list[str] = []
-        for name, comp in components.items():
-            if isinstance(comp, nn.Module):
-                self.register_component(name, comp)
-                registered.append(name)
-        return registered
+        source_id = id(source)
+        with self._lock:
+            existing_record = self._source_registrations.get(source_id)
+            if existing_record is not None:
+                return list(existing_record.keys())
+
+            registered: dict[str, Any] = {}
+            for name, comp in components.items():
+                if isinstance(comp, nn.Module):
+                    self.register_component(name, comp)
+                    registered[name] = comp
+            self._source_registrations[source_id] = registered
+            return list(registered.keys())
+
+    def unregister_components(self, source: Any) -> list[str]:
+        """Bulk-unregister using the per-source record from
+        :meth:`register_components`.
+
+        For each ``(name, module)`` pair this *source* originally
+        registered, decrements that module's refcount **if** the slot
+        still holds the same instance. Slots that were displaced by a
+        later registration from another source are skipped — the
+        displacement already decremented our refcount on the old module
+        at displacement time.
+
+        Modules shared with other still-registered sources survive
+        (refcount > 0); modules unique to this source are fully released
+        (refcount → 0 triggers hook cleanup, cache eviction, and slot
+        deletion).
+
+        Returns the list of names actually processed (skipping stale
+        entries). Empty list if *source* wasn't registered.
+        """
+        source_id = id(source)
+        with self._lock:
+            record = self._source_registrations.pop(source_id, None)
+            if record is None:
+                return []
+            processed: list[str] = []
+            for name, module in record.items():
+                current = self._managed_components.get(name)
+                if current is module:
+                    self.unregister_component(name)
+                    processed.append(name)
+                else:
+                    logger.debug(
+                        "unregister_components: skipping %r — slot was displaced by another source",
+                        name,
+                    )
+            return processed
+
+    def unload_components(self, source: Any) -> list[str]:
+        """Symmetric counterpart to bulk loading.
+
+        Equivalent to :meth:`unregister_components` under refcount-based
+        cleanup (cache eviction happens automatically when a module's
+        refcount hits 0). Kept for symmetry with the load/unload naming
+        of the singular methods.
+        """
+        return self.unregister_components(source)
 
     def get_component(self, name: str) -> Any | None:
         """Retrieve a managed component by name."""
@@ -673,11 +743,27 @@ class ModelManager:
     # ------------------------------------------------------------------
 
     def clear(self) -> None:
-        """Free all components, caches, and CUDA memory."""
+        """Free all components, caches, and CUDA memory.
+
+        Removes offload hooks from every managed module before dropping
+        references — calls ``remove_offload_hooks`` (idempotent and safe
+        even if the module had no hooks installed).
+        """
         with self._lock:
+            seen: set[int] = set()
+            for module in self._managed_components.values():
+                if id(module) in seen:
+                    continue
+                seen.add(id(module))
+                try:
+                    remove_offload_hooks(module)
+                except Exception as e:
+                    logger.warning("clear: failed to remove hooks: %s", e)
             self._component_cache.clear()
             self._managed_components.clear()
             self._component_strategies.clear()
+            self._refcount.clear()
+            self._source_registrations.clear()
             self._applied_strategy = None
             self._group_offload_use_stream = False
             self._group_offload_low_cpu_mem = False

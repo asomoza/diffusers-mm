@@ -133,7 +133,12 @@ class TestDisplacedModuleHookCleanup:
 
         assert shared not in cleaned
 
-    def test_displacing_under_non_hook_strategy_does_not_call_remove(self, monkeypatch):
+    def test_displacing_calls_remove_at_refcount_zero(self, monkeypatch):
+        # Under refcount-based cleanup, remove_offload_hooks is called
+        # whenever a module's refcount hits 0 — regardless of which
+        # strategy was previously applied. remove_offload_hooks is
+        # documented as idempotent so this is safe; the call is
+        # unconditional in the cleanup path.
         cleaned: list = []
         monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
 
@@ -141,27 +146,12 @@ class TestDisplacedModuleHookCleanup:
         old = DummyModel()
         mm.register_component("model", old)
         mm.apply_offload_strategy("cpu")
-        assert mm._component_strategies["model"] == "no_offload"
 
         new = DummyModel()
         mm.register_component("model", new)
 
-        assert old not in cleaned
-
-    def test_displacing_unhooked_pending_module_does_not_call_remove(self, monkeypatch):
-        # Module was registered but apply was never run — strategy state is
-        # absent for that slot, so nothing to clean up.
-        cleaned: list = []
-        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
-
-        mm = ModelManager(strategy="group_offload")
-        old = DummyModel()
-        mm.register_component("transformer", old)
-        # Note: no apply, so _component_strategies is empty.
-        new = DummyModel()
-        mm.register_component("transformer", new)
-
-        assert old not in cleaned
+        # old's refcount went 1 → 0 on displacement, so cleanup ran.
+        assert cleaned == [old]
 
 
 class TestUnregisterComponent:
@@ -224,7 +214,10 @@ class TestUnregisterComponent:
         assert shared not in cleaned
         assert mm.get_component("alias") is shared
 
-    def test_skips_cleanup_for_non_hook_strategy(self, monkeypatch):
+    def test_unregister_calls_remove_at_refcount_zero_regardless_of_strategy(self, monkeypatch):
+        # Under refcount-based cleanup, remove_offload_hooks is called
+        # whenever refcount hits 0 — even for strategies that didn't
+        # install hooks. The call is idempotent so this is safe.
         cleaned: list = []
         monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
 
@@ -234,7 +227,158 @@ class TestUnregisterComponent:
         mm.apply_offload_strategy("cpu")
 
         mm.unregister_component("model")
-        assert m not in cleaned
+        assert cleaned == [m]
+
+
+class TestRefcount:
+    """Refcount-based lifecycle: shared modules survive partial unregister."""
+
+    def test_register_component_always_increments(self):
+        mm = ModelManager()
+        m = DummyModel()
+        mm.register_component("a", m)
+        assert mm._refcount[id(m)] == 1
+        mm.register_component("a", m)  # same name + same module
+        assert mm._refcount[id(m)] == 2
+
+    def test_unregister_decrements_keeps_slot_alive_above_zero(self):
+        mm = ModelManager(strategy="no_offload")
+        m = DummyModel()
+        mm.register_component("a", m)
+        mm.register_component("a", m)  # refcount = 2
+        mm.apply_offload_strategy("cpu")
+
+        mm.unregister_component("a")
+        # refcount = 1 → slot stays
+        assert mm.get_component("a") is m
+        assert mm._refcount[id(m)] == 1
+
+        mm.unregister_component("a")
+        # refcount = 0 → cleanup
+        assert mm.get_component("a") is None
+        assert id(m) not in mm._refcount
+
+    def test_aliases_in_one_source_clean_up_both_slots(self, monkeypatch):
+        cleaned: list = []
+        monkeypatch.setattr("diffusers_mm.manager.remove_offload_hooks", lambda m: cleaned.append(m))
+
+        mm = ModelManager()
+        m = DummyModel()
+        mm.register_component("primary", m)
+        mm.register_component("alias", m)  # refcount = 2
+
+        mm.unregister_component("primary")  # refcount = 1, slot "primary" stays
+        assert mm.get_component("primary") is m
+        assert mm.get_component("alias") is m
+
+        mm.unregister_component("alias")  # refcount = 0, full cleanup
+        # Both slots gone, hooks cleaned (idempotent — no actual hooks here).
+        assert mm.get_component("primary") is None
+        assert mm.get_component("alias") is None
+        assert cleaned == [m]
+
+    def test_displacement_of_last_reference_evicts_cache(self):
+        mm = ModelManager()
+        m1 = DummyModel()
+        mm.load_component("transformer", "id-1", lambda: m1)
+        cache_key_1 = ModelManager.component_hash("id-1")
+        assert mm.get_cached(cache_key_1) is m1
+
+        m2 = DummyModel()
+        mm.register_component("transformer", m2)  # displaces m1, refcount(m1) → 0
+        # m1's cache entry evicted as part of refcount-zero cleanup.
+        assert mm.get_cached(cache_key_1) is None
+        assert mm.get_component("transformer") is m2
+
+
+class TestRegisterComponentsSource:
+    """Per-source idempotency and bulk lifecycle."""
+
+    def _make_pipe(self, **comps):
+        class FakePipe:
+            pass
+
+        p = FakePipe()
+        p.components = comps
+        return p
+
+    def test_register_components_is_idempotent_per_source(self):
+        mm = ModelManager()
+        m = DummyModel()
+        pipe = self._make_pipe(transformer=m)
+
+        mm.register_components(pipe)
+        assert mm._refcount[id(m)] == 1
+
+        mm.register_components(pipe)  # same pipe — no double counting
+        assert mm._refcount[id(m)] == 1
+
+    def test_two_sources_sharing_a_module_both_count(self):
+        mm = ModelManager()
+        shared = DummyModel()
+        pipe1 = self._make_pipe(text_encoder=shared)
+        pipe2 = self._make_pipe(text_encoder=shared)
+
+        mm.register_components(pipe1)
+        mm.register_components(pipe2)
+        assert mm._refcount[id(shared)] == 2
+
+    def test_unregister_components_only_decrements_its_source(self):
+        # pipe1 and pipe2 both use shared T5. pipe1 going away leaves
+        # T5 in the registry for pipe2.
+        mm = ModelManager()
+        shared = DummyModel()
+        pipe1 = self._make_pipe(text_encoder=shared)
+        pipe2 = self._make_pipe(text_encoder=shared)
+        mm.register_components(pipe1)
+        mm.register_components(pipe2)
+
+        mm.unregister_components(pipe1)
+        assert mm.get_component("text_encoder") is shared
+        assert mm._refcount[id(shared)] == 1
+
+        mm.unregister_components(pipe2)
+        assert mm.get_component("text_encoder") is None
+        assert id(shared) not in mm._refcount
+
+    def test_unregister_components_skips_displaced_slots(self):
+        # pipe1 registers Tx1; pipe2 displaces with Tx2.
+        # When pipe1 later unregisters, the stale "transformer → Tx1"
+        # entry in pipe1's record must be skipped (Tx1 was already
+        # cleaned up at displacement time).
+        mm = ModelManager()
+        Tx1 = DummyModel()
+        Tx2 = DummyModel()
+        pipe1 = self._make_pipe(transformer=Tx1)
+        pipe2 = self._make_pipe(transformer=Tx2)
+
+        mm.register_components(pipe1)
+        mm.register_components(pipe2)
+        # Tx1 was displaced → refcount(Tx1) hit 0 → cleaned up.
+        assert id(Tx1) not in mm._refcount
+        assert mm._refcount[id(Tx2)] == 1
+
+        # pipe1's stale unregister must NOT touch Tx2.
+        processed = mm.unregister_components(pipe1)
+        assert processed == []
+        assert mm._refcount[id(Tx2)] == 1
+        assert mm.get_component("transformer") is Tx2
+
+    def test_unregister_components_returns_empty_for_unknown_source(self):
+        mm = ModelManager()
+        pipe = self._make_pipe(transformer=DummyModel())
+        # Never registered.
+        assert mm.unregister_components(pipe) == []
+
+    def test_unload_components_delegates_to_unregister(self):
+        mm = ModelManager()
+        m = DummyModel()
+        pipe = self._make_pipe(transformer=m)
+        mm.register_components(pipe)
+
+        names = mm.unload_components(pipe)
+        assert names == ["transformer"]
+        assert mm.get_component("transformer") is None
 
 
 class TestUnloadComponent:
@@ -269,10 +413,11 @@ class TestUnloadComponent:
         mm.load_component("text_encoder", "id-1", factory)
         assert len(calls) == 2
 
-    def test_unload_keeps_cache_when_module_still_aliased(self):
-        # If the module is reachable under another name, evicting the
-        # cache would let the next load produce a duplicate of a module
-        # already in the registry. Keep the cache entry.
+    def test_unload_keeps_module_alive_when_aliased(self):
+        # Under refcount semantics, the slot for the unloaded name stays
+        # alive while another reference exists (the alias). Cache is
+        # preserved alongside. Both slots will only go away when the
+        # second alias is unloaded.
         mm = ModelManager()
         m = DummyModel()
         mm.load_component("primary", "id-1", lambda: m)
@@ -281,12 +426,17 @@ class TestUnloadComponent:
         assert mm.get_cached(cache_key) is m
 
         mm.unload_component("primary")
-        # "primary" is gone, but the alias still has it AND the cache
-        # is preserved so a future load via the alias's identifier
-        # finds the same module.
-        assert mm.get_component("primary") is None
+        # refcount(m) went 2 → 1; slot "primary" stays, module survives,
+        # cache survives.
+        assert mm.get_component("primary") is m
         assert mm.get_component("alias") is m
         assert mm.get_cached(cache_key) is m
+
+        # Unloading the second name drops refcount to 0 → full cleanup.
+        mm.unload_component("alias")
+        assert mm.get_component("primary") is None
+        assert mm.get_component("alias") is None
+        assert mm.get_cached(cache_key) is None
 
     def test_unload_cleans_hooks_for_hooked_strategy(self, monkeypatch):
         cleaned: list = []
