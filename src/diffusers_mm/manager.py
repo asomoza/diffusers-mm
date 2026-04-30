@@ -7,6 +7,7 @@ import contextvars
 import gc
 import hashlib
 import logging
+import sys
 import threading
 import weakref
 from collections.abc import Callable, Generator
@@ -96,6 +97,16 @@ class ModelManager:
     # the constant cannot capture that, so we pick a conservative value
     # that's safe for image diffusion and document the video gap.
     AUTO_BLOCK_PIN_WORKING_SET_GB = 6.5
+    # Windows pays a structural ~2 GiB penalty on top of the Linux value:
+    # ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` is Linux-only
+    # (relies on the CUDA virtual memory management API not exposed on
+    # the Windows driver), so the Windows allocator runs in fixed-segment
+    # mode and reserves more under the same load. Measured on the same
+    # LTX-2.3 int4 sweep above, ``peak_reserved`` was 2.0–2.8 GiB higher
+    # on Windows 16 GiB than Linux 32 GiB at every pin count. Splitting
+    # the constant by OS keeps Linux users from paying for an allocator
+    # regime they don't have. Override the same way as the Linux value.
+    AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB = 8.5
     # Don't bother with block_pin if the discoverable block list is
     # smaller than this — the overhead of per-block apply_group_offloading
     # outweighs the benefit when there are only a handful of blocks.
@@ -757,6 +768,18 @@ class ModelManager:
         with self._lock:
             self._block_pin_counts[component_name] = int(count)
 
+    def _resolve_working_set_gb(self) -> float:
+        """Return the platform-appropriate working-set margin.
+
+        Windows uses the higher constant because ``expandable_segments``
+        is Linux-only and the Windows allocator reserves ~2 GiB more
+        under the same load. See the class-level constants for the full
+        rationale.
+        """
+        if sys.platform == "win32":
+            return self.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB
+        return self.AUTO_BLOCK_PIN_WORKING_SET_GB
+
     def _compute_block_pin_count(
         self,
         component_name: str,
@@ -787,8 +810,9 @@ class ModelManager:
 
         vram_avail_gb, _ = self._detect_available_vram_gb(device)
         non_block_gb = non_block_size_bytes(component, block_attr) / (1024**3)
+        working_set_gb = self._resolve_working_set_gb()
 
-        budget_gb = vram_avail_gb - non_block_gb - self.AUTO_BLOCK_PIN_WORKING_SET_GB - per_block_gb
+        budget_gb = vram_avail_gb - non_block_gb - working_set_gb - per_block_gb
         if budget_gb <= 0:
             logger.warning(
                 "block_pin: %s — no VRAM budget for pinning (avail=%.1f, non_block=%.1f, "
@@ -796,7 +820,7 @@ class ModelManager:
                 component_name,
                 vram_avail_gb,
                 non_block_gb,
-                self.AUTO_BLOCK_PIN_WORKING_SET_GB,
+                working_set_gb,
                 per_block_gb,
             )
             return 0
@@ -813,9 +837,16 @@ class ModelManager:
         a working-set margin). Without ``expandable_segments``, allocator
         fragmentation can swallow 1–2 GiB and turn a careful budget into
         an OOM. Logged as a one-time hint when the strategy is applied.
+
+        Windows is skipped — ``expandable_segments`` depends on the CUDA
+        virtual memory management API not exposed on the Windows driver,
+        so the env var is a silent no-op there. The Windows working-set
+        constant already accounts for the larger allocator overhead.
         """
         import os
 
+        if sys.platform == "win32":
+            return
         conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
         if "expandable_segments:True" not in conf:
             logger.warning(

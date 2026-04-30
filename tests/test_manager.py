@@ -1177,8 +1177,11 @@ class TestBlockPinCount:
             mm.set_block_pin_count("transformer", -1)
 
     def test_auto_count_uses_vram_budget(self, monkeypatch):
-        # 12 GB VRAM, 0.5 GB non-block, 6.5 GB working set, 1 GB streamed
-        # in flight = 4.0 GB budget. Per-block size = 1 GB → 4 blocks fit.
+        # 12 GB VRAM, 0.5 GB non-block, 6.5 GB Linux working set, 1 GB
+        # streamed in flight = 4.0 GB budget. Per-block size = 1 GB → 4
+        # blocks fit. Pin sys.platform to "linux" so the test is stable
+        # regardless of host OS.
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
         _patch_vram(monkeypatch, 12.0)
         mm = ModelManager()
         # Stub the size helpers — actually allocating GB of params is not
@@ -1190,8 +1193,25 @@ class TestBlockPinCount:
         n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
         assert n == 4
 
+    def test_auto_count_uses_windows_working_set(self, monkeypatch):
+        # Same 12 GB VRAM / 0.5 GB non-block / 1 GB per-block as the Linux
+        # test, but on Windows the working set is 8.5 GiB → budget = 12 -
+        # 0.5 - 8.5 - 1 = 2.0 GB → 2 blocks fit (2 fewer than on Linux).
+        # This is the whole point of the OS split: don't make Linux pay
+        # for Windows' allocator overhead.
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        _patch_vram(monkeypatch, 12.0)
+        mm = ModelManager()
+        monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(1.0 * 1024**3))
+        monkeypatch.setattr("diffusers_mm.manager.non_block_size_bytes", lambda c, a: int(0.5 * 1024**3))
+        m = nn.Module()
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(20)])
+        n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
+        assert n == 2
+
     def test_auto_count_returns_zero_when_no_budget(self, monkeypatch, caplog):
         # 6 GB VRAM, 6 GB non-block → budget = 6 - 6 - 6.5 - 1 = -7.5 → 0 pinned.
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
         _patch_vram(monkeypatch, 6.0)
         mm = ModelManager()
         monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(1.0 * 1024**3))
