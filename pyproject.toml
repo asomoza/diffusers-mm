@@ -4,12 +4,29 @@ version = "0.1.0"
 description = "Smart model management for Hugging Face Diffusers pipelines"
 readme = "README.md"
 license = "Apache-2.0"
-authors = [{ name = "Alvaro Somoza" }]
+authors = [{ name = "Alvaro Somoza", email = "zcodeweb@gmail.com" }]
 requires-python = ">=3.10"
+keywords = ["diffusers", "huggingface", "offload", "vram", "model-management"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch",
     "psutil>=5.9",
 ]
+
+[project.urls]
+Homepage = "https://github.com/asomoza/diffusers-mm"
+Repository = "https://github.com/asomoza/diffusers-mm"
+Issues = "https://github.com/asomoza/diffusers-mm/issues"
 
 [project.optional-dependencies]
 dev = [
