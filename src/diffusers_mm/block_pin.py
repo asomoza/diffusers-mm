@@ -22,6 +22,7 @@ release pinned memory because the cache pools survive).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -29,6 +30,90 @@ from torch import nn
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BlockPinState:
+    """Snapshot of the pinned subset of one block_pin'd component.
+
+    Carries everything :func:`evict_pinned_subset` / :func:`repin_pinned_subset`
+    need to move the pinned subset between CPU and GPU after the fact —
+    without re-running the discovery that :func:`apply_block_pin` did at
+    apply time.
+
+    The overflow (non-pinned) blocks are deliberately *not* tracked here:
+    they have their own per-block ``apply_group_offloading`` hooks that
+    manage their placement, and touching them from this state object would
+    fight those hooks.
+
+    Attributes:
+        component: The top-level component (e.g. the transformer).
+        block_attr: Attribute name of the block list on the component
+            (e.g. ``"transformer_blocks"``).
+        n_pinned: Number of leading blocks that were pinned. The pinned
+            range is ``component.<block_attr>[:n_pinned]``.
+        device: The GPU device the pinned subset lives on when resident.
+        resident: ``True`` iff the pinned subset is currently on *device*.
+            Flipped by :func:`evict_pinned_subset` / :func:`repin_pinned_subset`.
+    """
+
+    component: nn.Module
+    block_attr: str
+    n_pinned: int
+    device: torch.device
+    resident: bool = True
+
+
+def _iter_pinned_targets(state: BlockPinState):
+    """Yield every ``nn.Module`` whose ``.to()`` should be called.
+
+    Walks the same set :func:`apply_block_pin` originally moved to *device*:
+    non-block top-level children + the first *n_pinned* blocks. Direct
+    top-level params/buffers of the component are handled separately
+    because they're not modules.
+    """
+    blocks = getattr(state.component, state.block_attr)
+    for child_name, child in state.component.named_children():
+        if child_name == state.block_attr:
+            continue
+        yield child
+    for i in range(min(state.n_pinned, len(blocks))):
+        yield blocks[i]
+
+
+def evict_pinned_subset(state: BlockPinState) -> None:
+    """Move *state*'s pinned subset to CPU and flip ``resident`` off.
+
+    Idempotent — calling on an already-evicted state is a no-op. Mirrors
+    the residency moves that :func:`apply_block_pin` did at apply time,
+    just in the reverse direction.
+    """
+    if not state.resident:
+        return
+    cpu = torch.device("cpu")
+    for mod in _iter_pinned_targets(state):
+        mod.to(cpu)
+    for _, p in state.component.named_parameters(recurse=False):
+        p.data = p.data.to(cpu)
+    for _, b in state.component.named_buffers(recurse=False):
+        b.data = b.data.to(cpu)
+    state.resident = False
+
+
+def repin_pinned_subset(state: BlockPinState) -> None:
+    """Move *state*'s pinned subset back to ``state.device`` and flip ``resident`` on.
+
+    Idempotent — calling on an already-resident state is a no-op.
+    """
+    if state.resident:
+        return
+    for mod in _iter_pinned_targets(state):
+        mod.to(state.device)
+    for _, p in state.component.named_parameters(recurse=False):
+        p.data = p.data.to(state.device)
+    for _, b in state.component.named_buffers(recurse=False):
+        b.data = b.data.to(state.device)
+    state.resident = True
 
 
 def find_largest_block_list(module: nn.Module) -> tuple[str, nn.ModuleList] | None:

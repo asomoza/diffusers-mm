@@ -30,6 +30,7 @@ def managed(
     dtype: torch.dtype | None = None,
     group_offload_use_stream: bool = _UNSET,
     group_offload_low_cpu_mem: bool = _UNSET,
+    block_pin_auto_evict: bool = _UNSET,
 ) -> Any:
     """Wrap a diffusers pipeline with smart model management.
 
@@ -73,6 +74,12 @@ def managed(
             avoids pinning a full copy of every weight upfront (which
             would ~double host RAM). Only honored when ``use_stream=True``.
             Default True.
+        block_pin_auto_evict: For the ``block_pin`` strategy, evict the
+            pinned subset to CPU when a neighbor component (text encoder,
+            VAE, etc.) runs, then repin on demand when the pinned
+            component's next forward fires. Frees several GiB of VRAM
+            during VAE decode at the cost of two extra CPU↔GPU transfers
+            per inference (typically 1–2 s on PCIe 4). Default True.
 
     Returns:
         The same pipeline object, augmented with a ``.mm`` attribute and
@@ -91,6 +98,8 @@ def managed(
             mm_kwargs["group_offload_use_stream"] = group_offload_use_stream
         if group_offload_low_cpu_mem is not _UNSET:
             mm_kwargs["group_offload_low_cpu_mem"] = group_offload_low_cpu_mem
+        if block_pin_auto_evict is not _UNSET:
+            mm_kwargs["block_pin_auto_evict"] = block_pin_auto_evict
         mm = ModelManager(**mm_kwargs)
     else:
         # Detect a likely-confused caller: passing both an existing manager
@@ -100,6 +109,7 @@ def managed(
             "strategy": strategy,
             "group_offload_use_stream": group_offload_use_stream,
             "group_offload_low_cpu_mem": group_offload_low_cpu_mem,
+            "block_pin_auto_evict": block_pin_auto_evict,
         }
         explicit = {k: v for k, v in passed.items() if v is not _UNSET}
         if explicit:

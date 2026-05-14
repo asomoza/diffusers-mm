@@ -17,10 +17,13 @@ import torch
 from torch import nn
 
 from diffusers_mm.block_pin import (
+    BlockPinState,
     apply_block_pin,
+    evict_pinned_subset,
     find_largest_block_list,
     non_block_size_bytes,
     per_block_size_bytes,
+    repin_pinned_subset,
 )
 from diffusers_mm.hooks import remove_offload_hooks
 
@@ -28,6 +31,19 @@ from diffusers_mm.hooks import remove_offload_hooks
 logger = logging.getLogger(__name__)
 
 OFFLOAD_STRATEGIES = ("auto", "no_offload", "model_offload", "group_offload", "block_pin")
+
+# Sentinel for "the wrapped method was not on the instance __dict__; restore
+# by deleting the instance attribute so the class-level method is reachable
+# again." See ``_wrap_neighbor_method`` for the rationale.
+_INSTANCE_ATTR_ABSENT: Any = object()
+
+# Methods on neighbor components (the non-pinned ones) we wrap with an
+# evict-first shim. Bound forward is handled by register_forward_pre_hook;
+# decode and encode are the standard diffusers VAE-style entry points that
+# bypass ``__call__``. Extend cautiously — every name here costs one
+# instance-attribute write per component on apply and one delete on
+# strategy transition.
+_BLOCK_PIN_NEIGHBOR_WRAP_METHODS: tuple[str, ...] = ("decode", "encode")
 
 _SCOPED_DEVICE: contextvars.ContextVar[torch.device | None] = contextvars.ContextVar(
     "diffusers_mm_scoped_device", default=None
@@ -117,6 +133,7 @@ class ModelManager:
         strategy: str = "auto",
         group_offload_use_stream: bool = True,
         group_offload_low_cpu_mem: bool = True,
+        block_pin_auto_evict: bool = True,
     ) -> None:
         self._lock = threading.RLock()
         self._component_cache: dict[str, Any] = {}
@@ -157,12 +174,36 @@ class ModelManager:
         # to pin on GPU. Names absent from this dict get auto-computed from
         # the available VRAM at apply time.
         self._block_pin_counts: dict[str, int] = {}
+        # Per-component pinned-subset state, populated when block_pin is
+        # applied. Drives the auto-evict / repin pre-forward hooks so the
+        # pinned weights don't squat on VRAM while a sibling component
+        # (e.g. the VAE during decode) needs the space.
+        self._block_pin_states: dict[str, BlockPinState] = {}
+        # All pre-forward hook handles installed by block_pin's auto-evict
+        # machinery — repin hooks on block-pinned components AND evict
+        # hooks on neighbor components. Wholesale-removed on strategy
+        # transition / clear.
+        self._block_pin_hook_handles: list[Any] = []
+        # Wrapped methods on non-pinned components (e.g. ``vae.decode``) —
+        # tracked so we can unwrap on strategy transition. Each entry:
+        # ``(component, method_name, restore_value)``. ``restore_value``
+        # is a saved bound method if the original was an instance attribute
+        # (rare); otherwise the sentinel ``_INSTANCE_ATTR_ABSENT`` which
+        # tells the unwrap step to ``delattr`` instead.
+        self._block_pin_wrapped_methods: list[tuple[Any, str, Any]] = []
+        # Per-neighbor explicit override for the auto-evict decision.
+        # ``True`` forces eviction on every call (paranoid mode); ``False``
+        # disables it entirely for that component (e.g. text encoders that
+        # don't need the headroom). A missing entry means "use the runtime
+        # free-VRAM check" — see ``_should_evict_for_neighbor``.
+        self._evict_on_neighbor: dict[str, bool] = {}
         self._applied_strategy: str | None = None
 
         self._offload_strategy: str = "auto"
         self.offload_strategy = strategy  # validate through setter
         self._group_offload_use_stream: bool = bool(group_offload_use_stream)
         self._group_offload_low_cpu_mem: bool = bool(group_offload_low_cpu_mem)
+        self._block_pin_auto_evict: bool = bool(block_pin_auto_evict)
 
     # ------------------------------------------------------------------
     # Strategy properties
@@ -199,6 +240,32 @@ class ModelManager:
     def group_offload_low_cpu_mem(self, value: bool) -> None:
         with self._lock:
             self._group_offload_low_cpu_mem = bool(value)
+
+    @property
+    def block_pin_auto_evict(self) -> bool:
+        """If True, ``block_pin`` evicts pinned blocks when a neighbor runs.
+
+        Without this, pinned blocks stay on GPU forever — fast for the
+        denoise loop (no per-step transfers) but wasteful during the
+        trailing VAE decode, which then has to share VRAM with the dead
+        transformer subset. With this on, every non-pinned component
+        installs a pre-forward / pre-decode / pre-encode hook that pushes
+        every resident pinned subset back to CPU before its own work
+        starts; the next pinned-component forward repins on demand.
+
+        The trade-off is one extra ~``pinned_size`` CPU↔GPU transfer per
+        eviction/repin cycle. For the common single-stage video flow
+        (encode → denoise loop → decode), that's two extra transfers
+        total — typically 1–2 s on PCIe 4 — in exchange for freeing
+        several GiB of VRAM during decode.
+        """
+        with self._lock:
+            return self._block_pin_auto_evict
+
+    @block_pin_auto_evict.setter
+    def block_pin_auto_evict(self, value: bool) -> None:
+        with self._lock:
+            self._block_pin_auto_evict = bool(value)
 
     @property
     def applied_strategy(self) -> str | None:
@@ -768,6 +835,31 @@ class ModelManager:
         with self._lock:
             self._block_pin_counts[component_name] = int(count)
 
+    def set_evict_on_neighbor(self, component_name: str, value: bool | None) -> None:
+        """Override the auto-evict decision for a specific neighbor component.
+
+        ``True`` — *always* evict pinned subsets when this component runs
+        (forward / decode / encode), regardless of how much VRAM is free.
+        Useful when the neighbor has a known large but inconsistent
+        activation footprint (e.g. video VAE decode at varying resolutions)
+        and you don't want to rely on the runtime check guessing right.
+
+        ``False`` — *never* evict pinned subsets when this component runs.
+        Useful for small-activation neighbors like text encoders, where
+        the eviction + repin transfer cost is pure overhead. The wrap is
+        still installed; it just no-ops.
+
+        ``None`` (default for any unset name) — let the runtime check
+        decide based on currently-free VRAM compared to the working-set
+        margin reserved at apply time. See
+        :meth:`_should_evict_for_neighbor`.
+        """
+        with self._lock:
+            if value is None:
+                self._evict_on_neighbor.pop(component_name, None)
+            else:
+                self._evict_on_neighbor[component_name] = bool(value)
+
     def _resolve_working_set_gb(self) -> float:
         """Return the platform-appropriate working-set margin.
 
@@ -893,6 +985,267 @@ class ModelManager:
         _, blocks = result
         return len(blocks) >= self.AUTO_BLOCK_PIN_MIN_BLOCKS
 
+    # ------------------------------------------------------------------
+    # Block-pin auto-evict (cross-component coordination)
+    # ------------------------------------------------------------------
+
+    def _should_evict_for_neighbor(self, neighbor_name: str | None) -> bool:
+        """Decide whether to evict pinned subsets before *neighbor_name* runs.
+
+        Three-tier policy:
+
+        1. **Per-component override** (``set_evict_on_neighbor``) — if the
+           user explicitly set ``True`` / ``False`` for this name, follow
+           that. This always wins.
+        2. **Runtime VRAM check** — query ``mem_get_info`` for currently
+           free VRAM. If it's at or above the working-set margin the
+           auto-budget reserved (``_resolve_working_set_gb``), the neighbor
+           fits without evicting pinned: skip. Otherwise something has
+           consumed more than expected and we evict to recover headroom.
+           If VRAM detection fails (``free=0.0``) we fail safe and evict.
+        3. **No states** — if no pinned subset exists, there's nothing to
+           evict; short-circuit before bothering with the VRAM query.
+
+        *neighbor_name* may be ``None`` for callers without identity info
+        (defensive — every install path threads the name through, so this
+        is only the fallback in case a future wrap forgets).
+        """
+        if neighbor_name is not None:
+            with self._lock:
+                override = self._evict_on_neighbor.get(neighbor_name)
+            if override is not None:
+                return override
+
+        with self._lock:
+            states = list(self._block_pin_states.values())
+        if not states:
+            return False
+
+        sample_device = states[0].device
+        free_gb, _ = self._detect_available_vram_gb(sample_device)
+        threshold_gb = self._resolve_working_set_gb()
+        return free_gb < threshold_gb
+
+    def _evict_all_pinned(self, neighbor_name: str | None = None) -> None:
+        """Pre-forward callback for neighbor components.
+
+        Pushes every currently-resident pinned subset back to CPU so the
+        about-to-run neighbor has the VRAM. Held subsets are repinned on
+        demand by :meth:`_repin_one_pinned` when the owning component's
+        own forward fires next.
+
+        Skips entirely if :meth:`_should_evict_for_neighbor` says the
+        neighbor has enough headroom (or the user disabled it for this
+        component). That's the cheap path most of the time on a healthy
+        system where the auto-budget's reservation hasn't been blown.
+
+        Logs the decision (with the inputs that drove it) so users can
+        diagnose unexpected behavior without instrumenting their own code
+        — without this, the install-time "auto-evict installed" line is
+        the only signal and you can't tell "eviction fired and helped"
+        apart from "eviction was correctly skipped" apart from "the hook
+        never fired at all" in a real inference run.
+        """
+        with self._lock:
+            states_snapshot = list(self._block_pin_states.values())
+        if not states_snapshot:
+            return
+
+        sample_device = states_snapshot[0].device
+        free_gb, _ = self._detect_available_vram_gb(sample_device)
+        threshold_gb = self._resolve_working_set_gb()
+        with self._lock:
+            override = self._evict_on_neighbor.get(neighbor_name) if neighbor_name else None
+
+        if not self._should_evict_for_neighbor(neighbor_name):
+            logger.info(
+                "block_pin: skip evict for %r (free=%.2f GiB >= threshold=%.2f GiB, override=%r)",
+                neighbor_name,
+                free_gb,
+                threshold_gb,
+                override,
+            )
+            return
+
+        evicted = 0
+        for state in states_snapshot:
+            if state.resident:
+                evict_pinned_subset(state)
+                evicted += 1
+        logger.info(
+            "block_pin: evicted %d subset(s) for %r (free=%.2f GiB, threshold=%.2f GiB, override=%r)",
+            evicted,
+            neighbor_name,
+            free_gb,
+            threshold_gb,
+            override,
+        )
+
+    def _repin_one_pinned(self, component_name: str) -> None:
+        """Pre-forward callback for a block-pinned component.
+
+        If the pinned subset is currently on CPU (a neighbor evicted it),
+        move it back to GPU before forward runs.
+        """
+        with self._lock:
+            state = self._block_pin_states.get(component_name)
+        if state is None:
+            return
+        if not state.resident:
+            repin_pinned_subset(state)
+
+    def _wrap_neighbor_method(self, component: Any, method_name: str, component_name: str) -> None:
+        """Wrap ``component.<method_name>`` to evict pinned subsets first.
+
+        Catches entry points that bypass ``__call__`` / ``forward``,
+        notably ``vae.decode`` and ``vae.encode`` — these never trigger
+        ``register_forward_pre_hook`` so the auto-evict logic would miss
+        them otherwise.
+
+        *component_name* is captured into the wrapper closure so the
+        runtime evict decision can check this component's
+        ``set_evict_on_neighbor`` override. Without it, the wrap would
+        always evict unconditionally, undermining the runtime check that
+        the forward-pre-hook path already respects.
+
+        Idempotent via a marker attribute on the wrapper: re-wrapping is a
+        no-op. The original is restored on strategy transition by either
+        deleting the instance attribute (when the original lived on the
+        class — the common case) or by re-assigning the saved bound
+        method (when the instance already had its own).
+        """
+        original = getattr(component, method_name, None)
+        if original is None or not callable(original):
+            return
+        if getattr(original, "_diffusers_mm_block_pin_wrap", False):
+            return  # Already wrapped (e.g. incremental apply).
+
+        # Was the attribute on the instance __dict__ (rare), or inherited
+        # from the class (common)? Restore needs to know which to do.
+        instance_already_had_attr = method_name in component.__dict__
+
+        manager = self
+        captured_name = component_name
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            manager._evict_all_pinned(captured_name)
+            return original(*args, **kwargs)
+
+        wrapper._diffusers_mm_block_pin_wrap = True  # type: ignore[attr-defined]
+        try:
+            wrapper.__wrapped__ = original  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        setattr(component, method_name, wrapper)
+        restore_value = original if instance_already_had_attr else _INSTANCE_ATTR_ABSENT
+        with self._lock:
+            self._block_pin_wrapped_methods.append((component, method_name, restore_value))
+
+    def _install_block_pin_auto_evict(
+        self,
+        new_pinned: list[tuple[str, Any, str, int]],
+        new_neighbors: list[tuple[str, Any]],
+        device: torch.device,
+    ) -> None:
+        """Record per-component pinned state and install the eviction hooks.
+
+        *new_pinned* are the components that got ``apply_block_pin`` this
+        call — they each get a pre-forward hook that repins their subset
+        on demand. *new_neighbors* are the fallback group_offload ones —
+        they each get a pre-forward hook (catches ``__call__``) plus
+        ``decode``/``encode`` method wraps that evict every resident
+        pinned subset before their own work starts.
+
+        Called per-apply so incremental registrations are handled: a new
+        component registered after the initial apply walks through here
+        and gets its hook(s) installed without disturbing existing ones.
+        Skips entirely when :attr:`block_pin_auto_evict` is False so the
+        opt-out is genuinely zero-cost.
+        """
+        # Record pinned-subset states unconditionally — the
+        # ``set_block_pin_count`` / inspection paths benefit from them
+        # even when the auto-evict feature is off.
+        for name, mod, block_attr, n in new_pinned:
+            with self._lock:
+                self._block_pin_states[name] = BlockPinState(
+                    component=mod,
+                    block_attr=block_attr,
+                    n_pinned=n,
+                    device=device,
+                    resident=True,
+                )
+
+        if not self._block_pin_auto_evict:
+            return
+
+        for name, mod, _block_attr, _n in new_pinned:
+            handle = mod.register_forward_pre_hook(lambda _module, _inputs, _name=name: self._repin_one_pinned(_name))
+            with self._lock:
+                self._block_pin_hook_handles.append(handle)
+
+        for name, mod in new_neighbors:
+            handle = mod.register_forward_pre_hook(lambda _module, _inputs, _name=name: self._evict_all_pinned(_name))
+            with self._lock:
+                self._block_pin_hook_handles.append(handle)
+            for method_name in _BLOCK_PIN_NEIGHBOR_WRAP_METHODS:
+                self._wrap_neighbor_method(mod, method_name, name)
+
+        if new_pinned or new_neighbors:
+            logger.info(
+                "block_pin: auto-evict installed (pinned=%d, neighbors=%d)",
+                len(new_pinned),
+                len(new_neighbors),
+            )
+
+    def _teardown_block_pin_auto_evict(self) -> None:
+        """Remove all auto-evict hooks and restore wrapped methods.
+
+        Called on strategy transition away from ``block_pin`` and on
+        :meth:`clear`. Before tearing down, makes sure every pinned subset
+        is moved back to GPU — the surrounding transition path will then
+        move everything to CPU via plain ``.to('cpu')``, but it relies on
+        the modules being in a consistent device state first.
+        """
+        with self._lock:
+            handles = list(self._block_pin_hook_handles)
+            self._block_pin_hook_handles.clear()
+            wrapped = list(self._block_pin_wrapped_methods)
+            self._block_pin_wrapped_methods.clear()
+            states = list(self._block_pin_states.values())
+            self._block_pin_states.clear()
+
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception as e:
+                logger.warning("block_pin: failed to remove auto-evict hook: %s", e)
+
+        for component, method_name, restore_value in wrapped:
+            try:
+                if restore_value is _INSTANCE_ATTR_ABSENT:
+                    if method_name in component.__dict__:
+                        delattr(component, method_name)
+                else:
+                    setattr(component, method_name, restore_value)
+            except Exception as e:
+                logger.warning("block_pin: failed to unwrap %s.%s: %s", type(component).__name__, method_name, e)
+
+        # If a neighbor ran last, pinned subsets may have been evicted to
+        # CPU — repin them so the subsequent transition's bulk ``.to('cpu')``
+        # operates on a consistent starting state, and so debugging tools
+        # see the residency the strategy promised.
+        for state in states:
+            if not state.resident:
+                try:
+                    repin_pinned_subset(state)
+                except Exception as e:
+                    logger.warning(
+                        "block_pin: failed to repin %s during teardown: %s",
+                        type(state.component).__name__,
+                        e,
+                    )
+
     def prepare_strategy_transition(self, new_strategy: str, device: torch.device | str) -> None:
         """Clean up the old offload strategy before applying *new_strategy*.
 
@@ -914,7 +1267,14 @@ class ModelManager:
                 return
 
             hook_based = old in ("group_offload", "model_offload", "block_pin")
+            was_block_pin = old == "block_pin"
 
+        # Done outside the lock so the teardown (which may take its own
+        # passes through ``self._lock``) doesn't deadlock against itself.
+        if was_block_pin:
+            self._teardown_block_pin_auto_evict()
+
+        with self._lock:
             seen_ids: set[int] = set()
             for name, mod in self._managed_components.items():
                 if id(mod) in seen_ids:
@@ -1055,6 +1415,11 @@ class ModelManager:
                 offload_kwargs.get("low_cpu_mem_usage", "absent"),
             )
             device_obj = torch.device(device) if isinstance(device, str) else device
+            # Track per-component outcomes so the auto-evict installer
+            # below knows which got a pinned subset (gets a repin hook)
+            # and which fell back to group_offload (gets evict hooks).
+            new_pinned: list[tuple[str, Any, str, int]] = []
+            new_neighbors: list[tuple[str, Any]] = []
             for name, mod in unique:
                 # Pre-clean any prior hooks so re-applying is safe (idempotent).
                 remove_offload_hooks(mod)
@@ -1068,6 +1433,7 @@ class ModelManager:
                             "block_pin: %s has no block list, fell back to group_offload",
                             name,
                         )
+                        new_neighbors.append((name, mod))
                     except Exception as e:
                         logger.warning("block_pin: group_offload fallback failed for %s: %s", name, e)
                     continue
@@ -1090,8 +1456,11 @@ class ModelManager:
                         block_attr,
                         len(blocks) - applied_n,
                     )
+                    new_pinned.append((name, mod, block_attr, applied_n))
                 except Exception as e:
                     logger.warning("block_pin: failed for %s: %s", name, e)
+
+            self._install_block_pin_auto_evict(new_pinned, new_neighbors, device_obj)
 
         with self._lock:
             for name, _ in unique:
@@ -1243,6 +1612,92 @@ class ModelManager:
     # Debugging
     # ------------------------------------------------------------------
 
+    def debug_vram_breakdown(self, *, device: torch.device | str | None = None) -> dict[str, float]:
+        """Print and return a dedicated-VRAM accounting breakdown.
+
+        Designed for the recurring "PyTorch says X but Task Manager says Y"
+        confusion. Three numbers matter on the dedicated-VRAM side:
+
+        - **Driver used** — ``cudaMemGetInfo``'s ``total - free``. The
+          authoritative "how much physical VRAM is committed right now"
+          number. Includes every allocation on the device: PyTorch's
+          caching allocator pool, CUDA context overhead, cuDNN/cuBLAS
+          workspaces, kernels that use ``cudaMalloc`` directly (e.g.
+          Triton scratch buffers), other processes.
+        - **PyTorch reserved** — what PyTorch's caching allocator holds in
+          its pool. Allocated + free-but-cached. This is what shrinks
+          back when you call :func:`torch.cuda.empty_cache`.
+        - **External** — driver-used minus PyTorch-reserved. Everything
+          on the device that PyTorch doesn't manage. On a typical run
+          this is CUDA context (~1 GiB) plus cuDNN workspaces. If it's
+          way bigger than that, suspect a non-PyTorch allocator (Triton,
+          cuFFT plans, etc.).
+
+        Crucially, this is the *dedicated* side only. On Windows, Task
+        Manager's "GPU Memory" line is dedicated + shared. Shared GPU
+        memory is CUDA-pinned host memory (system RAM mapped to GPU
+        address space) — created by ``apply_group_offloading`` when
+        ``low_cpu_mem_usage=True`` so streamed weights can transfer
+        without per-call pinning. That's not directly queryable from
+        CUDA, so it's not in this breakdown — but it's the most common
+        explanation when this method says "PyTorch peak is 9 GiB" while
+        Task Manager says "21 GiB".
+
+        Returns the same numbers as a dict for programmatic use.
+        """
+        gb = 1024**3
+        if not torch.cuda.is_available():
+            print("[debug_vram] CUDA not available")
+            return {}
+
+        target_device = device if device is not None else torch.cuda.current_device()
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(target_device)
+        except Exception as e:
+            print(f"[debug_vram] mem_get_info failed: {e}")
+            return {}
+        used_bytes = total_bytes - free_bytes
+
+        allocated = torch.cuda.memory_allocated(target_device)
+        reserved = torch.cuda.memory_reserved(target_device)
+        max_allocated = torch.cuda.max_memory_allocated(target_device)
+        max_reserved = torch.cuda.max_memory_reserved(target_device)
+
+        external_bytes = max(0, used_bytes - reserved)
+
+        print("[debug_vram] === Dedicated VRAM breakdown ===")
+        print(
+            f"[debug_vram] Driver used:        {used_bytes / gb:6.2f} / {total_bytes / gb:6.2f} GiB "
+            f"({free_bytes / gb:.2f} GiB free)"
+        )
+        print(f"[debug_vram] PyTorch allocated:  {allocated / gb:6.2f} GiB (peak {max_allocated / gb:6.2f} GiB)")
+        print(f"[debug_vram] PyTorch reserved:   {reserved / gb:6.2f} GiB (peak {max_reserved / gb:6.2f} GiB)")
+        print(f"[debug_vram] External (driver_used - pytorch_reserved): {external_bytes / gb:6.2f} GiB")
+        print("[debug_vram]   = CUDA context + cuDNN/cuBLAS workspaces + non-PyTorch allocators (e.g. Triton)")
+        print("[debug_vram] (Task Manager 'GPU Memory' on Windows also includes shared GPU memory,")
+        print("[debug_vram]  i.e. CUDA-pinned host buffers from group_offload — not shown here.)")
+
+        with self._lock:
+            states = dict(self._block_pin_states)
+        if states:
+            print("[debug_vram] === block_pin state ===")
+            for name, state in states.items():
+                print(
+                    f"[debug_vram]   {name}: n_pinned={state.n_pinned}, "
+                    f"resident={state.resident}, device={state.device}"
+                )
+
+        return {
+            "driver_used_gb": used_bytes / gb,
+            "driver_total_gb": total_bytes / gb,
+            "driver_free_gb": free_bytes / gb,
+            "pytorch_allocated_gb": allocated / gb,
+            "pytorch_reserved_gb": reserved / gb,
+            "pytorch_max_allocated_gb": max_allocated / gb,
+            "pytorch_max_reserved_gb": max_reserved / gb,
+            "external_gb": external_bytes / gb,
+        }
+
     @contextlib.contextmanager
     def record_memory_history(
         self,
@@ -1294,6 +1749,10 @@ class ModelManager:
         references — calls ``remove_offload_hooks`` (idempotent and safe
         even if the module had no hooks installed).
         """
+        # Done before taking the lock — teardown takes its own locks and
+        # the helper relies on ``_managed_components`` still being populated
+        # to find components to unwrap.
+        self._teardown_block_pin_auto_evict()
         with self._lock:
             seen: set[int] = set()
             for module in self._managed_components.values():
@@ -1318,6 +1777,9 @@ class ModelManager:
             self._applied_strategy = None
             self._group_offload_use_stream = True
             self._group_offload_low_cpu_mem = True
+            self._block_pin_auto_evict = True
+            self._block_pin_counts.clear()
+            self._evict_on_neighbor.clear()
         gc.collect()
         if torch.cuda.is_available():
             try:

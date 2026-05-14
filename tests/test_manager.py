@@ -9,10 +9,13 @@ import torch
 from torch import nn
 
 from diffusers_mm.block_pin import (
+    BlockPinState,
     apply_block_pin,
+    evict_pinned_subset,
     find_largest_block_list,
     non_block_size_bytes,
     per_block_size_bytes,
+    repin_pinned_subset,
 )
 from diffusers_mm.manager import ModelManager, get_device, get_dtype
 
@@ -1084,6 +1087,85 @@ class TestRecordMemoryHistory:
         assert not out.exists()
 
 
+class TestDebugVramBreakdown:
+    def test_returns_empty_dict_without_cuda(self, monkeypatch, capsys):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        mm = ModelManager()
+        result = mm.debug_vram_breakdown()
+        assert result == {}
+        assert "CUDA not available" in capsys.readouterr().out
+
+    def test_returns_breakdown_dict_with_mocked_cuda(self, monkeypatch, capsys):
+        # Patch the CUDA queries so we can run the breakdown on a CPU-only
+        # box. Verifies the formula (driver_used - pytorch_reserved =
+        # external) and the dict keys downstream code might depend on.
+        gb = 1024**3
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda d=None: (4 * gb, 16 * gb))
+        monkeypatch.setattr(torch.cuda, "memory_allocated", lambda d=None: 7 * gb)
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda d=None: 9 * gb)
+        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda d=None: 8 * gb)
+        monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda d=None: 10 * gb)
+
+        mm = ModelManager()
+        result = mm.debug_vram_breakdown()
+
+        assert result["driver_used_gb"] == 12.0  # 16 - 4
+        assert result["driver_free_gb"] == 4.0
+        assert result["driver_total_gb"] == 16.0
+        assert result["pytorch_allocated_gb"] == 7.0
+        assert result["pytorch_reserved_gb"] == 9.0
+        assert result["pytorch_max_allocated_gb"] == 8.0
+        assert result["pytorch_max_reserved_gb"] == 10.0
+        assert result["external_gb"] == 3.0  # driver_used (12) - pytorch_reserved (9)
+        out = capsys.readouterr().out
+        assert "Driver used" in out
+        assert "External" in out
+
+    def test_includes_block_pin_state_when_present(self, monkeypatch, capsys):
+        gb = 1024**3
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda d=None: (gb, 16 * gb))
+        monkeypatch.setattr(torch.cuda, "memory_allocated", lambda d=None: gb)
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda d=None: gb)
+        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda d=None: gb)
+        monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda d=None: gb)
+
+        mm = ModelManager()
+        mm._block_pin_states["transformer"] = BlockPinState(
+            component=nn.Linear(4, 4),  # any module — we only display metadata
+            block_attr="blocks",
+            n_pinned=23,
+            device=torch.device("cuda"),
+            resident=True,
+        )
+        mm.debug_vram_breakdown()
+        out = capsys.readouterr().out
+        assert "block_pin state" in out
+        assert "transformer: n_pinned=23" in out
+
+    def test_external_clamps_to_zero_when_pytorch_overreports(self, monkeypatch, capsys):
+        # Sanity: PyTorch's reserved counter can momentarily exceed
+        # mem_get_info's reported usage on some drivers (rounding,
+        # asynchronous allocator updates). External should never be
+        # reported as a negative number.
+        gb = 1024**3
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda d=None: (10 * gb, 16 * gb))
+        monkeypatch.setattr(torch.cuda, "memory_allocated", lambda d=None: 5 * gb)
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda d=None: 7 * gb)
+        monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda d=None: 5 * gb)
+        monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda d=None: 7 * gb)
+
+        mm = ModelManager()
+        result = mm.debug_vram_breakdown()
+        # driver_used (6) - pytorch_reserved (7) = -1 → clamp to 0
+        assert result["external_gb"] == 0.0
+
+
 class TestBlockPinHelpers:
     """Internals of the ``block_pin`` module."""
 
@@ -1363,6 +1445,605 @@ class TestBlockPinTransition:
         mm.prepare_strategy_transition("no_offload", "cpu")
         assert m in cleaned
         assert mm.applied_strategy == "no_offload"
+
+
+class _FakeTransformer(nn.Module):
+    """Block-pinnable component: has a real ``forward`` plus a block list."""
+
+    def __init__(self):
+        super().__init__()
+        self.head = nn.Linear(4, 4)
+        self.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(3)])
+
+    def forward(self, x):
+        return self.head(x)
+
+
+class _FakeVAE(nn.Module):
+    """Neighbor with explicit ``decode`` / ``encode`` entry points (the
+    typical diffusers VAE shape that bypasses ``__call__``)."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer = nn.Linear(4, 4)
+
+    def forward(self, x):
+        return self.layer(x)
+
+    def decode(self, x):
+        return self.layer(x)
+
+    def encode(self, x):
+        return self.layer(x)
+
+
+class _FakeTextEncoder(nn.Module):
+    """Neighbor without decode/encode — forward-only entry point."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer = nn.Linear(4, 4)
+
+    def forward(self, x):
+        return self.layer(x)
+
+
+def _stub_group_offload(monkeypatch):
+    """Make ``apply_group_offloading`` a no-op so block_pin tests don't
+    need a real CUDA / accelerate setup."""
+    monkeypatch.setattr(
+        "diffusers.hooks.group_offloading.apply_group_offloading",
+        lambda mod, **kwargs: None,
+    )
+
+
+class TestBlockPinAutoEvict:
+    """End-to-end checks for the cross-component auto-evict / repin
+    behavior introduced to keep VAE decode from sharing VRAM with the
+    permanently-resident pinned transformer."""
+
+    def test_state_recorded_after_apply(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        transformer = _FakeTransformer()
+        mm.register_component("transformer", transformer)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        assert state.component is transformer
+        assert state.block_attr == "blocks"
+        assert state.n_pinned == 3
+        assert state.resident is True
+
+    def test_neighbor_forward_evicts_pinned(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        transformer = _FakeTransformer()
+        text_encoder = _FakeTextEncoder()
+        mm.register_component("transformer", transformer)
+        mm.register_component("text_encoder", text_encoder)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        assert state.resident is True
+        text_encoder(torch.zeros(4))
+        assert state.resident is False
+
+    def test_pinned_forward_repins_after_evict(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        transformer = _FakeTransformer()
+        text_encoder = _FakeTextEncoder()
+        mm.register_component("transformer", transformer)
+        mm.register_component("text_encoder", text_encoder)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        text_encoder(torch.zeros(4))
+        assert state.resident is False
+
+        transformer(torch.zeros(4))
+        assert state.resident is True
+
+    def test_decode_wrap_evicts_pinned(self, monkeypatch):
+        # The headline reason this feature exists: ``vae.decode`` bypasses
+        # ``__call__``, so without method-level wrapping the pinned subset
+        # would stay resident through the entire video VAE decode pass.
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        assert state.resident is True
+        vae.decode(torch.zeros(4))
+        assert state.resident is False
+
+    def test_encode_wrap_evicts_pinned(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        vae.encode(torch.zeros(4))
+        assert state.resident is False
+
+    def test_auto_evict_disabled_skips_all_hooks(self, monkeypatch):
+        # Opt-out path: pinned state is still recorded (useful for the
+        # ``set_block_pin_count`` / inspection paths) but neither
+        # pre-forward hooks nor method wraps are installed, so behavior
+        # matches the pre-feature baseline.
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin", block_pin_auto_evict=False)
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        assert "transformer" in mm._block_pin_states
+        assert mm._block_pin_hook_handles == []
+        assert mm._block_pin_wrapped_methods == []
+        assert "decode" not in vae.__dict__
+
+        state = mm._block_pin_states["transformer"]
+        vae.decode(torch.zeros(4))
+        assert state.resident is True  # neighbor call did not flip residency
+
+    def test_transition_removes_hooks_and_restores_methods(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        # The wrap installed a shadowing instance attribute.
+        assert "decode" in vae.__dict__
+        assert "encode" in vae.__dict__
+        assert len(mm._block_pin_hook_handles) >= 2  # repin + neighbor evict
+
+        mm.prepare_strategy_transition("no_offload", "cpu")
+
+        # Wrapper instance attributes are gone; class-level methods reachable again.
+        assert "decode" not in vae.__dict__
+        assert "encode" not in vae.__dict__
+        assert mm._block_pin_states == {}
+        assert mm._block_pin_hook_handles == []
+        assert mm._block_pin_wrapped_methods == []
+
+        # Calling the restored decode does not affect any (now-empty) state.
+        vae.decode(torch.zeros(4))
+
+    def test_reapply_does_not_double_wrap(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        wrapper_once = vae.decode
+        decode_entries_before = [e for e in mm._block_pin_wrapped_methods if e[1] == "decode" and e[0] is vae]
+        assert len(decode_entries_before) == 1
+
+        # Idempotent re-apply: nothing pending, no new wraps.
+        mm.apply_offload_strategy("cpu")
+        assert vae.decode is wrapper_once
+        decode_entries_after = [e for e in mm._block_pin_wrapped_methods if e[1] == "decode" and e[0] is vae]
+        assert len(decode_entries_after) == 1
+
+    def test_incremental_neighbor_gets_evict_hook(self, monkeypatch):
+        # Registering a brand-new neighbor after the initial apply should
+        # pick up the same auto-evict wiring as the originals.
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        transformer = _FakeTransformer()
+        mm.register_component("transformer", transformer)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        # Manually flip residency on so we can observe an eviction.
+        state.resident = True
+
+        vae = _FakeVAE()
+        mm.register_component("vae", vae)
+        mm.apply_offload_strategy("cpu")
+
+        assert "decode" in vae.__dict__
+        vae.decode(torch.zeros(4))
+        assert state.resident is False
+
+    def test_clear_tears_down_auto_evict(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        assert "decode" in vae.__dict__
+        mm.clear()
+        assert "decode" not in vae.__dict__
+        assert mm._block_pin_states == {}
+        assert mm._block_pin_hook_handles == []
+        assert mm._block_pin_wrapped_methods == []
+
+
+class TestBlockPinAutoEvictConditional:
+    """Eviction shouldn't fire unconditionally — only when the runtime
+    check says we're tight on VRAM or the user explicitly forced it via
+    ``set_evict_on_neighbor``. The cpu-device default in the simpler
+    tests above happens to satisfy "tight" (free=0 < margin), which is
+    why they observe eviction; these tests pin down the conditional
+    branches explicitly."""
+
+    def test_abundant_vram_skips_eviction(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        # Plenty of free VRAM, way above the 6.5 GiB working-set margin.
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (50.0, 64.0))
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        # Pinned starts resident.
+        assert state.resident is True
+        vae.decode(torch.zeros(4))
+        # Runtime check saw 50 GiB free ≥ 6.5 GiB margin → skip eviction.
+        assert state.resident is True
+
+    def test_tight_vram_triggers_eviction(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (1.0, 16.0))
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        vae.decode(torch.zeros(4))
+        # 1 GiB free < 6.5 GiB margin → evict.
+        assert state.resident is False
+
+    def test_set_evict_on_neighbor_true_forces_eviction(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        # Plenty of free VRAM — runtime check would say "skip".
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (50.0, 64.0))
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+        # Override beats the runtime check.
+        mm.set_evict_on_neighbor("vae", True)
+
+        state = mm._block_pin_states["transformer"]
+        vae.decode(torch.zeros(4))
+        assert state.resident is False
+
+    def test_set_evict_on_neighbor_false_disables_eviction(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        # Tight free VRAM — runtime check would say "evict".
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (1.0, 16.0))
+        transformer = _FakeTransformer()
+        text_encoder = _FakeTextEncoder()
+        mm.register_component("transformer", transformer)
+        mm.register_component("text_encoder", text_encoder)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+        # Even though VRAM is tight, the user knows text_encoder doesn't
+        # need the headroom.
+        mm.set_evict_on_neighbor("text_encoder", False)
+
+        state = mm._block_pin_states["transformer"]
+        text_encoder(torch.zeros(4))
+        assert state.resident is True
+
+    def test_set_evict_on_neighbor_none_restores_runtime_check(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (50.0, 64.0))
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        mm.set_evict_on_neighbor("vae", True)
+        state = mm._block_pin_states["transformer"]
+        vae.decode(torch.zeros(4))
+        assert state.resident is False
+
+        # Restore residency to verify the override clears.
+        state.resident = True
+        mm.set_evict_on_neighbor("vae", None)
+        vae.decode(torch.zeros(4))
+        # Runtime check sees abundant VRAM → skip.
+        assert state.resident is True
+
+    def test_override_applies_to_forward_path_too(self, monkeypatch):
+        # The override should govern the register_forward_pre_hook path
+        # as well as the decode/encode wraps, not just one of them.
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (50.0, 64.0))
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+        mm.set_evict_on_neighbor("vae", True)
+
+        state = mm._block_pin_states["transformer"]
+        vae(torch.zeros(4))  # exercises forward, not decode
+        assert state.resident is False
+
+
+class TestTransformerOffloadCycle:
+    """End-to-end verification that the *transformer* (the block-pinned
+    component) actually goes off-device when a neighbor runs, then comes
+    back when its own forward fires next. The existing ``state.resident``
+    flag checks are necessary but not sufficient — these tests prove the
+    underlying tensor moves happen on the right targets.
+    """
+
+    def test_evict_repin_cycle_dispatches_to_calls(self):
+        # CPU-only spy test: replace ``.to`` on each candidate module with
+        # a recorder so we can verify (a) which modules were moved, (b)
+        # what device they were moved to, and (c) overflow blocks were
+        # not touched — without needing a real GPU.
+        transformer = _FakeTransformer()  # head + 3 blocks
+        # Add a direct top-level param to mirror LTX-2's scale_shift_table
+        # so the param-walk in evict/repin has something to chew on.
+        transformer.scale = nn.Parameter(torch.zeros(4))
+        fake_gpu = torch.device("cuda")
+
+        state = BlockPinState(
+            component=transformer,
+            block_attr="blocks",
+            n_pinned=2,
+            device=fake_gpu,
+            resident=True,
+        )
+
+        calls: dict[int, list[torch.device]] = {}
+        members = [transformer.head, transformer.blocks[0], transformer.blocks[1], transformer.blocks[2]]
+        for mod in members:
+            calls[id(mod)] = []
+
+        def make_stub(mod):
+            def stub(target, *args, **kwargs):
+                calls[id(mod)].append(torch.device(target) if isinstance(target, str) else target)
+                return mod
+
+            return stub
+
+        for mod in members:
+            mod.to = make_stub(mod)  # type: ignore[method-assign]
+
+        # Evict: pinned subset → cpu, overflow untouched.
+        evict_pinned_subset(state)
+        cpu = torch.device("cpu")
+
+        assert state.resident is False
+        assert calls[id(transformer.head)] == [cpu]
+        assert calls[id(transformer.blocks[0])] == [cpu]
+        assert calls[id(transformer.blocks[1])] == [cpu]
+        assert calls[id(transformer.blocks[2])] == []  # overflow not touched
+        # Direct top-level scale param was moved too (data reassigned to cpu).
+        assert transformer.scale.data.device.type == "cpu"
+
+        # Repin: back to state.device.
+        repin_pinned_subset(state)
+
+        assert state.resident is True
+        assert calls[id(transformer.head)] == [cpu, fake_gpu]
+        assert calls[id(transformer.blocks[0])] == [cpu, fake_gpu]
+        assert calls[id(transformer.blocks[1])] == [cpu, fake_gpu]
+        assert calls[id(transformer.blocks[2])] == []
+
+    def test_evict_is_idempotent(self):
+        # Second call on an already-evicted state must not call .to() again.
+        transformer = _FakeTransformer()
+        state = BlockPinState(
+            component=transformer,
+            block_attr="blocks",
+            n_pinned=2,
+            device=torch.device("cuda"),
+            resident=False,  # already evicted
+        )
+        calls: list[torch.device] = []
+        transformer.head.to = lambda target, *a, **kw: calls.append(target) or transformer.head  # type: ignore[method-assign]
+        evict_pinned_subset(state)
+        assert calls == []
+        assert state.resident is False
+
+    def test_repin_is_idempotent(self):
+        transformer = _FakeTransformer()
+        state = BlockPinState(
+            component=transformer,
+            block_attr="blocks",
+            n_pinned=2,
+            device=torch.device("cuda"),
+            resident=True,  # already resident
+        )
+        calls: list[torch.device] = []
+        transformer.head.to = lambda target, *a, **kw: calls.append(target) or transformer.head  # type: ignore[method-assign]
+        repin_pinned_subset(state)
+        assert calls == []
+        assert state.resident is True
+
+    @pytest.mark.gpu
+    def test_evict_repin_cycle_changes_cuda_memory(self):
+        # Real-device cycle: build a transformer on CUDA, evict it, and
+        # verify the GPU memory allocator actually reports the drop.
+        # Catches the case where the dispatch is correct but the actual
+        # ``.to('cpu')`` call somehow doesn't free VRAM (e.g. a hidden
+        # alias keeping the tensor on GPU).
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        device = torch.device("cuda")
+
+        class _BigTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # Sized so the move is comfortably above allocator noise
+                # (a 2048x2048 float32 linear ≈ 16 MiB params + 8 KiB bias).
+                self.head = nn.Linear(2048, 2048)
+                self.blocks = nn.ModuleList([nn.Linear(2048, 2048) for _ in range(3)])
+
+            def forward(self, x):
+                return self.head(x)
+
+        transformer = _BigTransformer().to(device)
+        # Mirror block_pin's residency: 2 pinned blocks on GPU, overflow on CPU.
+        transformer.blocks[2].to("cpu")
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        # Bytes that should leave GPU after evict (head + 2 pinned blocks).
+        pinned_bytes = 0
+        for mod in (transformer.head, transformer.blocks[0], transformer.blocks[1]):
+            pinned_bytes += sum(p.numel() * p.element_size() for p in mod.parameters())
+        pinned_mib = pinned_bytes / (1024 * 1024)
+
+        before = torch.cuda.memory_allocated()
+
+        state = BlockPinState(
+            component=transformer,
+            block_attr="blocks",
+            n_pinned=2,
+            device=device,
+            resident=True,
+        )
+
+        evict_pinned_subset(state)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+        after_evict = torch.cuda.memory_allocated()
+        freed = before - after_evict
+        # Allow some tolerance for allocator bookkeeping; the bulk of the
+        # pinned bytes must be off-GPU.
+        assert state.resident is False
+        assert freed >= pinned_bytes * 0.9, (
+            f"Expected ~{pinned_mib:.1f} MiB freed, got {freed / (1024 * 1024):.1f} MiB"
+        )
+        # The pinned subset's params should now report CPU device.
+        assert transformer.head.weight.device.type == "cpu"
+        assert transformer.blocks[0].weight.device.type == "cpu"
+        assert transformer.blocks[1].weight.device.type == "cpu"
+        # Overflow block must be untouched.
+        assert transformer.blocks[2].weight.device.type == "cpu"
+
+        # Repin and verify VRAM climbs back.
+        repin_pinned_subset(state)
+        torch.cuda.synchronize()
+
+        after_repin = torch.cuda.memory_allocated()
+        assert state.resident is True
+        assert after_repin >= before * 0.9, (
+            f"Expected VRAM to recover to ~{before / (1024 * 1024):.1f} MiB, got {after_repin / (1024 * 1024):.1f} MiB"
+        )
+        assert transformer.head.weight.device.type == "cuda"
+        assert transformer.blocks[0].weight.device.type == "cuda"
+        assert transformer.blocks[1].weight.device.type == "cuda"
+
+    @pytest.mark.gpu
+    def test_neighbor_call_evicts_transformer_from_cuda(self):
+        # Top-level integration check: with the strategy applied for real
+        # and the runtime check forced into "tight" mode, a neighbor's
+        # call actually moves the pinned transformer subset off CUDA.
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        # apply_group_offloading on a leaf-only neighbor still works on
+        # CUDA, but we stub it here so the test stays self-contained and
+        # doesn't depend on diffusers internals.
+        from unittest import mock
+
+        device = torch.device("cuda")
+
+        class _BigTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = nn.Linear(2048, 2048)
+                self.blocks = nn.ModuleList([nn.Linear(2048, 2048) for _ in range(3)])
+
+            def forward(self, x):
+                return self.head(x)
+
+        transformer = _BigTransformer()
+        text_encoder = _FakeTextEncoder()
+
+        with mock.patch("diffusers.hooks.group_offloading.apply_group_offloading", lambda mod, **kwargs: None):
+            mm = ModelManager(strategy="block_pin")
+            # Force "tight VRAM" so the runtime check decides to evict.
+            mm._detect_available_vram_gb = lambda d: (0.5, 16.0)  # type: ignore[assignment]
+            mm.register_component("transformer", transformer)
+            mm.register_component("text_encoder", text_encoder)
+            mm.set_block_pin_count("transformer", 2)
+            mm.apply_offload_strategy(device)
+
+            state = mm._block_pin_states["transformer"]
+            assert state.resident is True
+            assert transformer.head.weight.device.type == "cuda"
+            assert transformer.blocks[0].weight.device.type == "cuda"
+            assert transformer.blocks[1].weight.device.type == "cuda"
+
+            # Neighbor runs → eviction triggered via the forward_pre_hook.
+            text_encoder.to(device)
+            text_encoder(torch.zeros(4, device=device))
+
+            torch.cuda.synchronize()
+            assert state.resident is False
+            assert transformer.head.weight.device.type == "cpu"
+            assert transformer.blocks[0].weight.device.type == "cpu"
+            assert transformer.blocks[1].weight.device.type == "cpu"
+
+            # Transformer's own forward fires → repin.
+            transformer(torch.zeros(2048, device=device))
+
+            torch.cuda.synchronize()
+            assert state.resident is True
+            assert transformer.head.weight.device.type == "cuda"
+            assert transformer.blocks[0].weight.device.type == "cuda"
+            assert transformer.blocks[1].weight.device.type == "cuda"
 
 
 class TestThreadSafety:

@@ -18,7 +18,7 @@ from diffusers import LTX2Pipeline
 from diffusers_mm import managed
 
 pipe = LTX2Pipeline.from_pretrained("OzzyGT/LTX-2.3-Distilled", torch_dtype=torch.bfloat16)
-pipe = managed(pipe)  # auto strategy based on VRAM + component sizes — just works
+pipe = managed(pipe)  # auto strategy based on VRAM + component sizes
 video, audio = pipe(prompt="A cat walking on a beach")
 ```
 

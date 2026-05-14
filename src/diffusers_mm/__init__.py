@@ -33,8 +33,18 @@ from diffusers_mm.managed import managed  # noqa: E402
 from diffusers_mm.manager import ModelManager  # noqa: E402
 
 
+try:
+    from importlib.metadata import version as _pkg_version
+
+    __version__ = _pkg_version("diffusers-mm")
+    del _pkg_version
+except Exception:  # noqa: BLE001
+    __version__ = "0.0.0+unknown"
+
+
 __all__ = [
     "ModelManager",
+    "__version__",
     "managed",
     "remove_offload_hooks",
 ]
