@@ -55,6 +55,12 @@ class BlockPinState:
         device: The GPU device the pinned subset lives on when resident.
         resident: ``True`` iff the pinned subset is currently on *device*.
             Flipped by :func:`evict_pinned_subset` / :func:`repin_pinned_subset`.
+        pinned_size_bytes: Total bytes the pinned subset occupies — pinned
+            blocks plus the non-block top-level parts that
+            :func:`evict_pinned_subset` also moves. Cached at apply time so
+            the auto-evict pre-forward hook (on the hot path) can decide
+            "does host RAM have room for this eviction?" without re-walking
+            module parameters every call.
     """
 
     component: nn.Module
@@ -62,6 +68,7 @@ class BlockPinState:
     n_pinned: int
     device: torch.device
     resident: bool = True
+    pinned_size_bytes: int = 0
 
 
 def _iter_pinned_targets(state: BlockPinState):

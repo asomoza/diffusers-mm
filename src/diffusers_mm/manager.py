@@ -127,6 +127,26 @@ class ModelManager:
     # smaller than this — the overhead of per-block apply_group_offloading
     # outweighs the benefit when there are only a handful of blocks.
     AUTO_BLOCK_PIN_MIN_BLOCKS = 8
+    # Safety headroom for the auto-evict RAM check. When the pre-forward
+    # hook decides "free VRAM is below the working-set margin, I should
+    # evict the pinned subset", we also check that the host can absorb
+    # the evicted weights without itself OOMing. The check is:
+    #
+    #   ram_available_gb >= evicted_subset_gb + RAM_EVICT_HEADROOM_GB
+    #
+    # The headroom covers the about-to-run neighbor's own ``pin_memory``
+    # allocations for streaming + activations + OS slack. Default 4 GiB
+    # is comfortable for image/video diffusion neighbors; bump it if your
+    # neighbors have unusually large host-side staging needs.
+    #
+    # Real-world trigger: a Windows user with 24 GiB VRAM and 32 GiB RAM
+    # hit ``pin_memory()`` OOM on the connectors forward after auto-evict
+    # pushed ~12 GiB of int8 transformer blocks from VRAM to a host that
+    # had 1.8 GiB free. The eviction "succeeded" (via swap) but starved
+    # the next ``cudaHostAlloc`` call. With this check, the eviction is
+    # refused, the pinned subset stays on GPU, and the neighbor is left
+    # to fit in whatever VRAM is free — not great, but not strictly worse.
+    AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB = 4.0
 
     def __init__(
         self,
@@ -620,17 +640,76 @@ class ModelManager:
     def _detect_available_ram_gb(self) -> tuple[float, float]:
         """Return ``(available_gb, total_gb)`` of system RAM.
 
-        ``available`` is what's actually free for new allocations right now
-        (free + reclaimable cache, per ``psutil.virtual_memory()``). Returns
-        ``(0.0, 0.0)`` if psutil can't be queried.
+        On Linux/macOS: returns ``psutil.virtual_memory().available`` —
+        what's actually free for new allocations right now (free +
+        reclaimable cache).
+
+        On Windows: applies ComfyUI-style adjusted accounting because
+        ``psutil.available`` is too conservative there. WDDM inflates the
+        system-wide commit charge by every VRAM allocation as a worst-
+        case page-out reserve, even though that "committed" memory isn't
+        actually competing for physical RAM. The adjusted figure is:
+
+            adjusted = physical_total - (committed - vram_in_use)
+
+        and we return ``max(psutil.available, adjusted)`` so the manager's
+        downstream decisions (strategy resolution, low_cpu_mem auto-tune,
+        block_pin tier-4 RAM-absorb check) operate on a realistic number.
+        Borrowed from ``comfy/windows.py``; see ``_windows.py`` for the
+        ctypes wrapping.
+
+        Returns ``(0.0, 0.0)`` if psutil can't be queried at all. On
+        Windows, if the PSAPI call fails we silently fall back to
+        psutil's value — the warning is logged inside ``_windows.py``.
         """
         try:
             import psutil
 
             vm = psutil.virtual_memory()
-            return vm.available / (1024**3), vm.total / (1024**3)
+            psutil_avail_gb = vm.available / (1024**3)
+            total_gb = vm.total / (1024**3)
         except Exception:
             return 0.0, 0.0
+
+        if sys.platform != "win32":
+            return psutil_avail_gb, total_gb
+
+        from diffusers_mm._windows import query_performance_info_bytes
+
+        result = query_performance_info_bytes()
+        if result is None:
+            return psutil_avail_gb, total_gb
+
+        committed_bytes, physical_total_bytes = result
+        vram_in_use_bytes = self._total_vram_in_use_bytes()
+        adjusted_bytes = physical_total_bytes - (committed_bytes - vram_in_use_bytes)
+        adjusted_gb = adjusted_bytes / (1024**3)
+        # Use the more generous of psutil and the adjusted figure. On a
+        # healthy system the two agree closely; the adjustment only
+        # matters when VRAM is heavily allocated and WDDM has inflated
+        # the commit charge.
+        return max(psutil_avail_gb, adjusted_gb), total_gb
+
+    def _total_vram_in_use_bytes(self) -> int:
+        """Return total VRAM currently allocated across all CUDA devices.
+
+        Used by the Windows free-RAM adjustment to back out WDDM's
+        speculative commit charge for VRAM. Sums ``(total - free)`` from
+        ``torch.cuda.mem_get_info`` over every visible CUDA device.
+        Returns 0 if CUDA isn't available or any device query fails —
+        the caller treats that as "no adjustment", which is safer than
+        over-subtracting and reporting more RAM than actually exists.
+        """
+        try:
+            if not torch.cuda.is_available():
+                return 0
+            total = 0
+            for i in range(torch.cuda.device_count()):
+                free, dev_total = torch.cuda.mem_get_info(i)
+                total += dev_total - free
+            return total
+        except Exception:
+            return 0
 
     def _detect_available_vram_gb(self, device: torch.device | str) -> tuple[float, float]:
         """Return ``(available_gb, total_gb)`` of VRAM on *device*.
@@ -992,19 +1071,28 @@ class ModelManager:
     def _should_evict_for_neighbor(self, neighbor_name: str | None) -> bool:
         """Decide whether to evict pinned subsets before *neighbor_name* runs.
 
-        Three-tier policy:
+        Four-tier policy:
 
         1. **Per-component override** (``set_evict_on_neighbor``) — if the
            user explicitly set ``True`` / ``False`` for this name, follow
            that. This always wins.
-        2. **Runtime VRAM check** — query ``mem_get_info`` for currently
+        2. **No states** — if no pinned subset exists, there's nothing to
+           evict; short-circuit before bothering with the VRAM query.
+        3. **Runtime VRAM check** — query ``mem_get_info`` for currently
            free VRAM. If it's at or above the working-set margin the
            auto-budget reserved (``_resolve_working_set_gb``), the neighbor
            fits without evicting pinned: skip. Otherwise something has
-           consumed more than expected and we evict to recover headroom.
+           consumed more than expected and we'd *want* to evict.
            If VRAM detection fails (``free=0.0``) we fail safe and evict.
-        3. **No states** — if no pinned subset exists, there's nothing to
-           evict; short-circuit before bothering with the VRAM query.
+        4. **Runtime RAM-absorb check** — if step 3 wants to evict, also
+           verify the host can absorb the evicted subset without itself
+           running out. Compare ``ram_available`` against
+           ``evicted_subset + AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB``. If
+           the host can't absorb, refuse to evict — pushing 10+ GiB of
+           weights into a host with no room left would just trigger an
+           ``cudaHostAlloc`` failure on the neighbor's next ``pin_memory``
+           call, which is strictly worse than letting the neighbor try to
+           fit in whatever VRAM is free.
 
         *neighbor_name* may be ``None`` for callers without identity info
         (defensive — every install path threads the name through, so this
@@ -1024,7 +1112,20 @@ class ModelManager:
         sample_device = states[0].device
         free_gb, _ = self._detect_available_vram_gb(sample_device)
         threshold_gb = self._resolve_working_set_gb()
-        return free_gb < threshold_gb
+        if free_gb >= threshold_gb:
+            return False
+
+        resident = [s for s in states if s.resident]
+        if not resident:
+            return False
+
+        evicted_gb = sum(s.pinned_size_bytes for s in resident) / (1024**3)
+        ram_avail_gb, _ = self._detect_available_ram_gb()
+        required_ram_gb = evicted_gb + self.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB
+        if ram_avail_gb > 0 and ram_avail_gb < required_ram_gb:
+            return False
+
+        return True
 
     def _evict_all_pinned(self, neighbor_name: str | None = None) -> None:
         """Pre-forward callback for neighbor components.
@@ -1058,13 +1159,41 @@ class ModelManager:
             override = self._evict_on_neighbor.get(neighbor_name) if neighbor_name else None
 
         if not self._should_evict_for_neighbor(neighbor_name):
-            logger.info(
-                "block_pin: skip evict for %r (free=%.2f GiB >= threshold=%.2f GiB, override=%r)",
-                neighbor_name,
-                free_gb,
-                threshold_gb,
-                override,
-            )
+            # Pick the most informative log line based on *why* the
+            # decision was skip. Mirrors the policy in
+            # :meth:`_should_evict_for_neighbor` so the message reflects
+            # the binding constraint.
+            if override is False:
+                logger.info(
+                    "block_pin: skip evict for %r (override=False)",
+                    neighbor_name,
+                )
+            elif free_gb >= threshold_gb:
+                logger.info(
+                    "block_pin: skip evict for %r (free=%.2f GiB >= threshold=%.2f GiB, override=%r)",
+                    neighbor_name,
+                    free_gb,
+                    threshold_gb,
+                    override,
+                )
+            else:
+                resident = [s for s in states_snapshot if s.resident]
+                evicted_gb = sum(s.pinned_size_bytes for s in resident) / (1024**3)
+                ram_avail_gb, _ = self._detect_available_ram_gb()
+                required_ram_gb = evicted_gb + self.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB
+                logger.warning(
+                    "block_pin: eviction needed for %r (vram free=%.2f GiB < threshold=%.2f GiB) "
+                    "but host RAM cannot absorb evicted subset (avail=%.2f GiB < %.2f GiB = "
+                    "%.2f evicted + %.2f headroom). Keeping pinned subset on GPU; "
+                    "neighbor may OOM if it doesn't fit in free VRAM.",
+                    neighbor_name,
+                    free_gb,
+                    threshold_gb,
+                    ram_avail_gb,
+                    required_ram_gb,
+                    evicted_gb,
+                    self.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB,
+                )
             return
 
         evicted = 0
@@ -1165,8 +1294,16 @@ class ModelManager:
         """
         # Record pinned-subset states unconditionally — the
         # ``set_block_pin_count`` / inspection paths benefit from them
-        # even when the auto-evict feature is off.
+        # even when the auto-evict feature is off. Cache the eviction
+        # footprint (pinned blocks + non-block top-level parts that
+        # ``evict_pinned_subset`` also moves) so the auto-evict
+        # pre-forward hook can do the RAM-absorb check without
+        # re-walking module parameters every call.
         for name, mod, block_attr, n in new_pinned:
+            blocks = getattr(mod, block_attr)
+            per_block = per_block_size_bytes(blocks)
+            non_block = non_block_size_bytes(mod, block_attr)
+            pinned_size = n * per_block + non_block
             with self._lock:
                 self._block_pin_states[name] = BlockPinState(
                     component=mod,
@@ -1174,6 +1311,7 @@ class ModelManager:
                     n_pinned=n,
                     device=device,
                     resident=True,
+                    pinned_size_bytes=pinned_size,
                 )
 
         if not self._block_pin_auto_evict:

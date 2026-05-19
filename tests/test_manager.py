@@ -894,6 +894,170 @@ class TestRamDetection:
         assert any("exceed available RAM" in rec.message for rec in caplog.records)
 
 
+class TestWindowsRamAccounting:
+    """The Windows path of ``_detect_available_ram_gb`` adjusts for WDDM
+    commit-charge inflation. Borrowed from ComfyUI; see ``_windows.py``.
+    Tests monkeypatch ``sys.platform`` + the PSAPI helper so they run on
+    Linux."""
+
+    def test_non_windows_skips_adjustment(self, monkeypatch):
+        # Non-Windows path: psutil is the source of truth, no PSAPI call.
+        import sys as _sys
+
+        monkeypatch.setattr(_sys, "platform", "linux")
+        # If anything reaches the Windows helper on this path it's a bug.
+        monkeypatch.setattr(
+            "diffusers_mm._windows.query_performance_info_bytes",
+            lambda: (_ for _ in ()).throw(AssertionError("should not be called on linux")),
+        )
+        mm = ModelManager()
+        avail, total = mm._detect_available_ram_gb()
+        assert avail > 0.0
+        assert total >= avail
+
+    def test_windows_uses_adjusted_when_more_generous(self, monkeypatch):
+        # WDDM commit-inflated case: psutil says 2 GiB free, but the
+        # adjusted formula (total − (committed − vram_in_use)) yields
+        # 10 GiB. We should return 10, not 2.
+        import sys as _sys
+
+        monkeypatch.setattr(_sys, "platform", "win32")
+
+        # Fake psutil values: 32 GiB total, 2 GiB available.
+        class _FakeVM:
+            total = 32 * (1024**3)
+            available = 2 * (1024**3)
+
+        monkeypatch.setattr("psutil.virtual_memory", lambda: _FakeVM())
+
+        # Fake PSAPI: 32 GiB physical, 30 GiB committed.
+        monkeypatch.setattr(
+            "diffusers_mm._windows.query_performance_info_bytes",
+            lambda: (30 * (1024**3), 32 * (1024**3)),
+        )
+
+        mm = ModelManager()
+        # Fake VRAM-in-use: 10 GiB. Adjusted = 32 − (30 − 10) = 12 GiB.
+        monkeypatch.setattr(mm, "_total_vram_in_use_bytes", lambda: 10 * (1024**3))
+
+        avail, total = mm._detect_available_ram_gb()
+        assert total == pytest.approx(32.0, abs=0.01)
+        # max(2, 12) = 12 → we report the adjusted figure.
+        assert avail == pytest.approx(12.0, abs=0.01)
+
+    def test_windows_uses_psutil_when_more_generous(self, monkeypatch):
+        # Healthy case: psutil's number already exceeds the adjusted
+        # figure (e.g. fresh system, no VRAM held). We should not
+        # *lower* the reported available by switching to adjusted.
+        import sys as _sys
+
+        monkeypatch.setattr(_sys, "platform", "win32")
+
+        class _FakeVM:
+            total = 32 * (1024**3)
+            available = 20 * (1024**3)
+
+        monkeypatch.setattr("psutil.virtual_memory", lambda: _FakeVM())
+        # Committed equals physical → adjusted = 0 + vram_in_use = small.
+        monkeypatch.setattr(
+            "diffusers_mm._windows.query_performance_info_bytes",
+            lambda: (32 * (1024**3), 32 * (1024**3)),
+        )
+
+        mm = ModelManager()
+        monkeypatch.setattr(mm, "_total_vram_in_use_bytes", lambda: 1 * (1024**3))
+
+        avail, _total = mm._detect_available_ram_gb()
+        # max(20, 1) → keep psutil's 20.
+        assert avail == pytest.approx(20.0, abs=0.01)
+
+    def test_windows_psapi_failure_falls_back_to_psutil(self, monkeypatch):
+        # If GetPerformanceInfo fails, the helper returns None and we
+        # quietly use psutil's number.
+        import sys as _sys
+
+        monkeypatch.setattr(_sys, "platform", "win32")
+
+        class _FakeVM:
+            total = 32 * (1024**3)
+            available = 5 * (1024**3)
+
+        monkeypatch.setattr("psutil.virtual_memory", lambda: _FakeVM())
+        monkeypatch.setattr(
+            "diffusers_mm._windows.query_performance_info_bytes",
+            lambda: None,
+        )
+
+        mm = ModelManager()
+        avail, total = mm._detect_available_ram_gb()
+        assert avail == pytest.approx(5.0, abs=0.01)
+        assert total == pytest.approx(32.0, abs=0.01)
+
+    def test_user_reported_scenario(self, monkeypatch):
+        # Real-world log: 24 GiB VRAM, 32 GiB RAM, psutil reported
+        # 1.8 GiB available while the system was loading the int8
+        # pipeline. WDDM had committed ~22 GiB worth of VRAM-backed
+        # reserve on top of the actual host commitments. With the
+        # adjustment, we should see a more honest "usable" number.
+        import sys as _sys
+
+        monkeypatch.setattr(_sys, "platform", "win32")
+
+        class _FakeVM:
+            total = 32 * (1024**3)
+            available = int(1.8 * (1024**3))
+
+        monkeypatch.setattr("psutil.virtual_memory", lambda: _FakeVM())
+
+        # Suppose committed = 47 GiB (overcommit on a 32 GiB box is
+        # possible because pagefile + WDDM padding); VRAM in use is
+        # ~22 GiB out of 24.
+        monkeypatch.setattr(
+            "diffusers_mm._windows.query_performance_info_bytes",
+            lambda: (47 * (1024**3), 32 * (1024**3)),
+        )
+        mm = ModelManager()
+        monkeypatch.setattr(mm, "_total_vram_in_use_bytes", lambda: 22 * (1024**3))
+
+        avail, _ = mm._detect_available_ram_gb()
+        # Adjusted = 32 − (47 − 22) = 7 GiB. max(1.8, 7) = 7.
+        # That's the more honest "usable" figure the strategy
+        # resolver should see.
+        assert avail == pytest.approx(7.0, abs=0.01)
+
+
+class TestTotalVramInUse:
+    def test_returns_zero_when_no_cuda(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        mm = ModelManager()
+        assert mm._total_vram_in_use_bytes() == 0
+
+    def test_sums_across_devices(self, monkeypatch):
+        # Fake two devices, each with (total - free) = 4 GiB. Sum = 8.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+        monkeypatch.setattr(
+            torch.cuda,
+            "mem_get_info",
+            lambda i: (4 * (1024**3), 8 * (1024**3)),  # free=4, total=8 → in_use=4
+        )
+        mm = ModelManager()
+        assert mm._total_vram_in_use_bytes() == 8 * (1024**3)
+
+    def test_failure_returns_zero(self, monkeypatch):
+        # Defensive: any exception inside the loop should be swallowed
+        # and the caller's adjustment falls back gracefully.
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+
+        def boom(_i):
+            raise RuntimeError("driver hiccup")
+
+        monkeypatch.setattr(torch.cuda, "mem_get_info", boom)
+        mm = ModelManager()
+        assert mm._total_vram_in_use_bytes() == 0
+
+
 class TestAutoTuneGroupOffload:
     """When auto picks group_offload, knobs should be tuned to the hardware."""
 
@@ -1810,6 +1974,121 @@ class TestBlockPinAutoEvictConditional:
         state = mm._block_pin_states["transformer"]
         vae(torch.zeros(4))  # exercises forward, not decode
         assert state.resident is False
+
+
+class TestBlockPinAutoEvictRamAware:
+    """Eviction should refuse to push the pinned subset to a host that
+    can't absorb it. Without this guard, evicting ~12 GiB of int8 weights
+    into a host with 1.8 GiB free succeeds via swap but starves the
+    neighbor's next ``pin_memory`` call (real-world Windows OOM logged
+    by a user, May 2026)."""
+
+    def test_low_ram_refuses_eviction(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        # Tight VRAM → runtime check wants to evict.
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (1.0, 16.0))
+        # Critically low RAM → cannot absorb the evicted subset.
+        monkeypatch.setattr(mm, "_detect_available_ram_gb", lambda: (1.8, 32.0))
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        # Force the state to claim a pinned-subset size that exceeds
+        # available RAM + headroom. _FakeTransformer is tiny so the
+        # real cached size is bytes, not GiB; spoof it.
+        state.pinned_size_bytes = int(10 * (1024**3))  # 10 GiB pinned
+
+        vae.decode(torch.zeros(4))
+        # 1.8 GiB available < 10 GiB evicted + 4 GiB headroom → refuse.
+        assert state.resident is True
+
+    def test_abundant_ram_allows_eviction(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (1.0, 16.0))
+        # Plenty of RAM to absorb whatever we evict.
+        monkeypatch.setattr(mm, "_detect_available_ram_gb", lambda: (128.0, 128.0))
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        state.pinned_size_bytes = int(10 * (1024**3))
+
+        vae.decode(torch.zeros(4))
+        # 128 GiB ≥ 10 + 4 → evict proceeds.
+        assert state.resident is False
+
+    def test_ram_detection_failure_does_not_block_eviction(self, monkeypatch):
+        # When psutil is unavailable, ``_detect_available_ram_gb`` returns
+        # (0.0, 0.0). We treat 0.0 as "unknown, don't gate" rather than
+        # "no RAM" — otherwise systems without psutil would never evict.
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (1.0, 16.0))
+        monkeypatch.setattr(mm, "_detect_available_ram_gb", lambda: (0.0, 0.0))
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        state.pinned_size_bytes = int(10 * (1024**3))
+
+        vae.decode(torch.zeros(4))
+        assert state.resident is False
+
+    def test_override_true_beats_ram_check(self, monkeypatch):
+        # Per-component override is tier 1, above the RAM-absorb check.
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (50.0, 64.0))
+        monkeypatch.setattr(mm, "_detect_available_ram_gb", lambda: (1.0, 32.0))
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+        mm.set_evict_on_neighbor("vae", True)
+
+        state = mm._block_pin_states["transformer"]
+        state.pinned_size_bytes = int(50 * (1024**3))  # way bigger than RAM
+
+        vae.decode(torch.zeros(4))
+        # Override forces evict regardless of RAM.
+        assert state.resident is False
+
+    def test_pinned_size_cached_at_apply(self, monkeypatch):
+        # Verify the cached ``pinned_size_bytes`` reflects pinned blocks +
+        # non-block parts (the same set ``evict_pinned_subset`` moves).
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (50.0, 64.0))
+        transformer = _FakeTransformer()
+        mm.register_component("transformer", transformer)
+        mm.set_block_pin_count("transformer", 2)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+
+        # 2 blocks (each nn.Linear(4,4) = 16 weights + 4 bias = 20 floats)
+        # + non-block head (same shape) = 60 floats × 4 bytes = 240 bytes.
+        from diffusers_mm.block_pin import non_block_size_bytes, per_block_size_bytes
+
+        expected = 2 * per_block_size_bytes(transformer.blocks) + non_block_size_bytes(transformer, "blocks")
+        assert state.pinned_size_bytes == expected
+        assert state.pinned_size_bytes > 0
 
 
 class TestTransformerOffloadCycle:
