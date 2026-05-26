@@ -154,7 +154,85 @@ class ModelManager:
         group_offload_use_stream: bool = True,
         group_offload_low_cpu_mem: bool = True,
         block_pin_auto_evict: bool = True,
+        *,
+        auto_no_offload_factor: float | None = None,
+        auto_model_offload_factor: float | None = None,
+        auto_ram_headroom: float | None = None,
+        auto_low_cpu_mem_ram_headroom_gb: float | None = None,
+        auto_block_pin_working_set_gb: float | None = None,
+        auto_block_pin_working_set_windows_gb: float | None = None,
+        auto_block_pin_min_blocks: int | None = None,
+        auto_block_pin_ram_evict_headroom_gb: float | None = None,
     ) -> None:
+        """Construct a manager.
+
+        The first four arguments configure runtime behaviour. The
+        ``auto_*`` keyword-only arguments tune the size-aware ``"auto"``
+        resolver — each one defaults to the class constant of the same
+        name (uppercased) when left as ``None``. Set the class constant
+        on a subclass for a global default; pass the ctor arg for a
+        per-instance override; assign ``mm.AUTO_FOO = value`` for live
+        mutation after construction.
+
+        Args:
+            strategy: Offload strategy. ``"auto"`` (default) resolves
+                against VRAM / RAM / component sizes; explicit values
+                bypass the resolver. One of ``"auto"``, ``"no_offload"``,
+                ``"model_offload"``, ``"group_offload"``, ``"block_pin"``.
+            group_offload_use_stream: Use CUDA streams for group offload
+                transfers. Overlaps CPU↔GPU copies with compute, typically
+                1.5–3× faster on hardware that supports it.
+            group_offload_low_cpu_mem: Defer pinned-host-buffer allocation
+                per transfer instead of pre-pinning a full copy of every
+                streamed weight. Lower host RAM, slightly slower
+                steady-state. Only honored when ``use_stream=True``.
+            block_pin_auto_evict: When the ``block_pin`` strategy is
+                active, evict the pinned subset back to CPU before a
+                neighbor (text encoder, VAE, ...) runs, then repin on
+                demand. Frees several GiB of VRAM during VAE decode at
+                the cost of two extra CPU↔GPU transfers per inference.
+            auto_no_offload_factor: Activation margin for the
+                ``no_offload`` tier. ``pipeline_weights × this`` must fit
+                in available VRAM. Default ``1.5`` (≈0.3 GiB headroom
+                above empirical peak for SDXL/Flux/Wan-class image
+                pipelines). Raise if your workload has unusually large
+                activations relative to weights.
+            auto_model_offload_factor: Activation margin for the
+                ``model_offload`` tier. ``largest_component × this`` must
+                fit in available VRAM. Same default and rationale as
+                ``auto_no_offload_factor``.
+            auto_ram_headroom: Fraction of RAM the resolver considers
+                "usable" before logging a 'workload won't fit on host'
+                warning. Default ``0.85`` (15% safety margin for OS +
+                activations + transient buffers).
+            auto_low_cpu_mem_ram_headroom_gb: When ``auto`` picks
+                ``group_offload``, flip ``low_cpu_mem_usage`` to ``False``
+                (faster transfers, higher host RAM) if
+                ``RAM ≥ pipeline_weights + this``. Default ``16.0`` GiB.
+                Lower the headroom on RAM-rich systems to bias toward
+                speed; raise it on tight systems to stay in low-RAM mode.
+            auto_block_pin_working_set_gb: VRAM reserved per
+                ``block_pin`` component for the streaming overflow's
+                working set (pinned host buffers in flight + activations
+                + per-step peaks). Default ``6.5`` GiB — calibrated for
+                image diffusion. Long-video workloads (e.g. LTX-2.3 at
+                768×512×121f) measure 10–14 GiB and should bump this.
+            auto_block_pin_working_set_windows_gb: Same as above, but
+                applied on Windows. Default ``8.5`` GiB — ~2 GiB higher
+                because the Windows allocator runs in fixed-segment mode
+                (no ``expandable_segments`` support) and reserves more
+                under the same load.
+            auto_block_pin_min_blocks: Minimum block count required for
+                ``auto`` to pick ``block_pin`` over plain
+                ``group_offload``. Default ``8`` — below this, per-block
+                ``apply_group_offloading`` overhead outweighs the benefit
+                of pinning.
+            auto_block_pin_ram_evict_headroom_gb: Safety margin for the
+                ``block_pin`` auto-evict RAM-absorb check. Eviction fires
+                only when ``ram_available ≥ evicted_subset + this``.
+                Default ``4.0`` GiB. Raise on systems where neighbors
+                have unusually large host-side staging needs.
+        """
         self._lock = threading.RLock()
         self._component_cache: dict[str, Any] = {}
         self._managed_components: dict[str, Any] = {}
@@ -224,6 +302,27 @@ class ModelManager:
         self._group_offload_use_stream: bool = bool(group_offload_use_stream)
         self._group_offload_low_cpu_mem: bool = bool(group_offload_low_cpu_mem)
         self._block_pin_auto_evict: bool = bool(block_pin_auto_evict)
+
+        # Per-instance overrides for the auto-resolver constants. We
+        # shadow the class attribute with an instance attribute only
+        # when the user explicitly passed a value, so subclassing /
+        # ``mm.AUTO_X = value`` mutation continue to work unchanged.
+        if auto_no_offload_factor is not None:
+            self.AUTO_NO_OFFLOAD_FACTOR = float(auto_no_offload_factor)
+        if auto_model_offload_factor is not None:
+            self.AUTO_MODEL_OFFLOAD_FACTOR = float(auto_model_offload_factor)
+        if auto_ram_headroom is not None:
+            self.AUTO_RAM_HEADROOM = float(auto_ram_headroom)
+        if auto_low_cpu_mem_ram_headroom_gb is not None:
+            self.AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB = float(auto_low_cpu_mem_ram_headroom_gb)
+        if auto_block_pin_working_set_gb is not None:
+            self.AUTO_BLOCK_PIN_WORKING_SET_GB = float(auto_block_pin_working_set_gb)
+        if auto_block_pin_working_set_windows_gb is not None:
+            self.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB = float(auto_block_pin_working_set_windows_gb)
+        if auto_block_pin_min_blocks is not None:
+            self.AUTO_BLOCK_PIN_MIN_BLOCKS = int(auto_block_pin_min_blocks)
+        if auto_block_pin_ram_evict_headroom_gb is not None:
+            self.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB = float(auto_block_pin_ram_evict_headroom_gb)
 
     # ------------------------------------------------------------------
     # Strategy properties

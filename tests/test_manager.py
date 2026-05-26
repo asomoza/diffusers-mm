@@ -58,6 +58,93 @@ class TestModelManagerInit:
         assert mm.group_offload_low_cpu_mem is False
 
 
+class TestAutoTuningCtorArgs:
+    """The ``auto_*`` keyword-only args shadow the class constants per instance.
+
+    Reads in the resolver go through ``self.AUTO_X``, so a non-``None``
+    ctor arg sets the instance attribute and Python's normal lookup
+    picks it up. ``None`` leaves the class default in place.
+    """
+
+    def test_defaults_unset_so_class_constants_apply(self):
+        mm = ModelManager()
+        # Reading ``mm.AUTO_X`` should reach the class constant — confirm
+        # by checking it equals the documented default.
+        assert mm.AUTO_NO_OFFLOAD_FACTOR == 1.5
+        assert mm.AUTO_MODEL_OFFLOAD_FACTOR == 1.5
+        assert mm.AUTO_RAM_HEADROOM == 0.85
+        assert mm.AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB == 16.0
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 6.5
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB == 8.5
+        assert mm.AUTO_BLOCK_PIN_MIN_BLOCKS == 8
+        assert mm.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB == 4.0
+        # No instance attribute shadow exists when defaults were used.
+        assert "AUTO_NO_OFFLOAD_FACTOR" not in mm.__dict__
+        assert "AUTO_BLOCK_PIN_WORKING_SET_GB" not in mm.__dict__
+
+    def test_ctor_args_shadow_class_constants(self):
+        mm = ModelManager(
+            auto_no_offload_factor=2.0,
+            auto_model_offload_factor=1.8,
+            auto_ram_headroom=0.9,
+            auto_low_cpu_mem_ram_headroom_gb=24.0,
+            auto_block_pin_working_set_gb=12.0,
+            auto_block_pin_working_set_windows_gb=14.0,
+            auto_block_pin_min_blocks=12,
+            auto_block_pin_ram_evict_headroom_gb=6.0,
+        )
+        assert mm.AUTO_NO_OFFLOAD_FACTOR == 2.0
+        assert mm.AUTO_MODEL_OFFLOAD_FACTOR == 1.8
+        assert mm.AUTO_RAM_HEADROOM == 0.9
+        assert mm.AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB == 24.0
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 12.0
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB == 14.0
+        assert mm.AUTO_BLOCK_PIN_MIN_BLOCKS == 12
+        assert mm.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB == 6.0
+        # Each override should produce an instance attribute (verifies
+        # we're shadowing, not mutating the class).
+        assert "AUTO_NO_OFFLOAD_FACTOR" in mm.__dict__
+        assert ModelManager.AUTO_NO_OFFLOAD_FACTOR == 1.5  # class untouched
+
+    def test_min_blocks_coerced_to_int(self):
+        # AUTO_BLOCK_PIN_MIN_BLOCKS is the only int constant — confirm
+        # we coerce floats to int rather than silently leaving them.
+        mm = ModelManager(auto_block_pin_min_blocks=10.7)
+        assert mm.AUTO_BLOCK_PIN_MIN_BLOCKS == 10
+        assert isinstance(mm.AUTO_BLOCK_PIN_MIN_BLOCKS, int)
+
+    def test_live_mutation_via_attribute_assignment_still_works(self):
+        # Documented escape hatch: mutate the constant after construction.
+        # Must continue working regardless of whether the ctor arg was used.
+        mm = ModelManager()
+        mm.AUTO_BLOCK_PIN_WORKING_SET_GB = 10.0
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 10.0
+        # And on top of an existing ctor override:
+        mm2 = ModelManager(auto_block_pin_working_set_gb=12.0)
+        mm2.AUTO_BLOCK_PIN_WORKING_SET_GB = 15.0
+        assert mm2.AUTO_BLOCK_PIN_WORKING_SET_GB == 15.0
+
+    def test_ctor_arg_affects_resolver_decision(self):
+        # End-to-end check: raising AUTO_NO_OFFLOAD_FACTOR should push the
+        # auto-resolver past the no_offload threshold even when the
+        # default factor would have allowed it.
+        mm = ModelManager(strategy="auto", auto_no_offload_factor=4.0)
+        # No components registered → resolver falls back to the simple
+        # VRAM-only tier table, which doesn't use the factor. Register a
+        # tiny component so the size-aware path runs instead.
+        mm.register_component("tiny", DummyModel())
+
+        # Patch the env so the size-aware path is reached with plenty
+        # of VRAM/RAM, but the factored threshold is the binding rule.
+        mm._detect_available_vram_gb = lambda device: (10.0, 10.0)
+        mm._detect_available_ram_gb = lambda: (64.0, 64.0)
+        mm._estimate_components_size_gb = lambda: (3.0, 3.0)
+        # weights=3.0 GiB, factor=4.0 → required 12.0 GiB; VRAM=10.0 → fail tier 1.
+        # Without our override (factor=1.5 → required 4.5 GiB) tier 1 would pass.
+        resolved = mm.resolve_offload_strategy("cuda")
+        assert resolved != "no_offload"
+
+
 class TestGroupOffloadKwargs:
     """Validate the kwargs builder's output for each setting combination."""
 

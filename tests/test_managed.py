@@ -93,6 +93,58 @@ class TestManagedGroupOffloadOptions:
         assert pipe.mm.group_offload_low_cpu_mem is True
 
 
+class TestManagedAutoTuningKwargs:
+    """The 8 ``auto_*`` knobs should reach the manager constructed inside managed()."""
+
+    def test_all_auto_kwargs_forwarded(self):
+        pipe = FakePipeline(transformer=DummyModel())
+        managed(
+            pipe,
+            device="cpu",
+            strategy="no_offload",  # avoid resolver branches; we only care about config wiring
+            auto_no_offload_factor=2.5,
+            auto_model_offload_factor=2.0,
+            auto_ram_headroom=0.9,
+            auto_low_cpu_mem_ram_headroom_gb=24.0,
+            auto_block_pin_working_set_gb=12.0,
+            auto_block_pin_working_set_windows_gb=14.0,
+            auto_block_pin_min_blocks=12,
+            auto_block_pin_ram_evict_headroom_gb=6.0,
+        )
+        mm = pipe.mm
+        assert mm.AUTO_NO_OFFLOAD_FACTOR == 2.5
+        assert mm.AUTO_MODEL_OFFLOAD_FACTOR == 2.0
+        assert mm.AUTO_RAM_HEADROOM == 0.9
+        assert mm.AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB == 24.0
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 12.0
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB == 14.0
+        assert mm.AUTO_BLOCK_PIN_MIN_BLOCKS == 12
+        assert mm.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB == 6.0
+
+    def test_unset_kwargs_leave_class_defaults(self):
+        pipe = FakePipeline(transformer=DummyModel())
+        managed(pipe, device="cpu", strategy="no_offload")
+        mm = pipe.mm
+        # No auto_* kwargs passed → instance attrs should not exist.
+        assert "AUTO_NO_OFFLOAD_FACTOR" not in mm.__dict__
+        assert "AUTO_BLOCK_PIN_WORKING_SET_GB" not in mm.__dict__
+        # And class defaults are reached as normal.
+        assert mm.AUTO_NO_OFFLOAD_FACTOR == 1.5
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 6.5
+
+    def test_auto_kwarg_with_existing_mm_warns_and_is_ignored(self, caplog):
+        # Mixing mm= with any config kwarg (including the new auto_* ones)
+        # should warn and not mutate the existing manager's configuration.
+        mm = ModelManager(strategy="no_offload")
+        pipe = FakePipeline(transformer=DummyModel())
+        with caplog.at_level("WARNING"):
+            managed(pipe, mm=mm, device="cpu", auto_block_pin_working_set_gb=12.0)
+        assert any("an existing ModelManager was supplied along with" in rec.message for rec in caplog.records)
+        # Manager's class default still applies — the kwarg was dropped.
+        assert "AUTO_BLOCK_PIN_WORKING_SET_GB" not in mm.__dict__
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 6.5
+
+
 class TestManagedSharedManager:
     def test_two_pipelines_share_manager(self):
         mm = ModelManager(strategy="model_offload")

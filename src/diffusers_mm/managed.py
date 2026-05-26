@@ -31,6 +31,14 @@ def managed(
     group_offload_use_stream: bool = _UNSET,
     group_offload_low_cpu_mem: bool = _UNSET,
     block_pin_auto_evict: bool = _UNSET,
+    auto_no_offload_factor: float = _UNSET,
+    auto_model_offload_factor: float = _UNSET,
+    auto_ram_headroom: float = _UNSET,
+    auto_low_cpu_mem_ram_headroom_gb: float = _UNSET,
+    auto_block_pin_working_set_gb: float = _UNSET,
+    auto_block_pin_working_set_windows_gb: float = _UNSET,
+    auto_block_pin_min_blocks: int = _UNSET,
+    auto_block_pin_ram_evict_headroom_gb: float = _UNSET,
 ) -> Any:
     """Wrap a diffusers pipeline with smart model management.
 
@@ -80,6 +88,30 @@ def managed(
             component's next forward fires. Frees several GiB of VRAM
             during VAE decode at the cost of two extra CPU↔GPU transfers
             per inference (typically 1–2 s on PCIe 4). Default True.
+        auto_no_offload_factor: Activation margin for the ``no_offload``
+            auto tier (``pipeline_weights × this`` must fit in VRAM).
+            Default ``1.5``.
+        auto_model_offload_factor: Activation margin for the
+            ``model_offload`` auto tier (``largest_component × this``
+            must fit in VRAM). Default ``1.5``.
+        auto_ram_headroom: Fraction of RAM treated as "usable" before
+            logging a 'workload won't fit' warning. Default ``0.85``.
+        auto_low_cpu_mem_ram_headroom_gb: RAM headroom (GiB) required to
+            flip ``group_offload``'s ``low_cpu_mem_usage=False`` when
+            ``auto`` picks it. Default ``16.0``.
+        auto_block_pin_working_set_gb: VRAM (GiB) reserved per
+            ``block_pin`` component for streaming working set on
+            Linux/macOS. Default ``6.5``. Bump for long-video workloads
+            (10–14 GiB measured at 768×512×121f).
+        auto_block_pin_working_set_windows_gb: Same as above on Windows
+            (no ``expandable_segments``, ~2 GiB structural overhead).
+            Default ``8.5``.
+        auto_block_pin_min_blocks: Minimum block count required before
+            ``auto`` will pick ``block_pin`` over ``group_offload``.
+            Default ``8``.
+        auto_block_pin_ram_evict_headroom_gb: RAM safety margin (GiB)
+            for the ``block_pin`` auto-evict RAM-absorb check. Default
+            ``4.0``.
 
     Returns:
         The same pipeline object, augmented with a ``.mm`` attribute and
@@ -88,38 +120,41 @@ def managed(
     if isinstance(device, str):
         device = torch.device(device)
 
+    # All caller-supplied configuration knobs, in the same shape we'd
+    # forward them to ``ModelManager``. Used twice below: once to build
+    # the new-manager kwargs, once to warn when the caller mixed an
+    # existing manager with config kwargs.
+    config_kwargs = {
+        "strategy": strategy,
+        "group_offload_use_stream": group_offload_use_stream,
+        "group_offload_low_cpu_mem": group_offload_low_cpu_mem,
+        "block_pin_auto_evict": block_pin_auto_evict,
+        "auto_no_offload_factor": auto_no_offload_factor,
+        "auto_model_offload_factor": auto_model_offload_factor,
+        "auto_ram_headroom": auto_ram_headroom,
+        "auto_low_cpu_mem_ram_headroom_gb": auto_low_cpu_mem_ram_headroom_gb,
+        "auto_block_pin_working_set_gb": auto_block_pin_working_set_gb,
+        "auto_block_pin_working_set_windows_gb": auto_block_pin_working_set_windows_gb,
+        "auto_block_pin_min_blocks": auto_block_pin_min_blocks,
+        "auto_block_pin_ram_evict_headroom_gb": auto_block_pin_ram_evict_headroom_gb,
+    }
+    explicit = {k: v for k, v in config_kwargs.items() if v is not _UNSET}
+
     if mm is None:
         # Build kwargs only for explicitly-passed values so ModelManager's
         # own defaults govern unset ones.
-        mm_kwargs: dict[str, Any] = {}
-        if strategy is not _UNSET:
-            mm_kwargs["strategy"] = strategy
-        if group_offload_use_stream is not _UNSET:
-            mm_kwargs["group_offload_use_stream"] = group_offload_use_stream
-        if group_offload_low_cpu_mem is not _UNSET:
-            mm_kwargs["group_offload_low_cpu_mem"] = group_offload_low_cpu_mem
-        if block_pin_auto_evict is not _UNSET:
-            mm_kwargs["block_pin_auto_evict"] = block_pin_auto_evict
-        mm = ModelManager(**mm_kwargs)
-    else:
+        mm = ModelManager(**explicit)
+    elif explicit:
         # Detect a likely-confused caller: passing both an existing manager
         # AND configuration kwargs. The kwargs would be ignored, so surface
         # the mismatch instead of silently dropping intent.
-        passed = {
-            "strategy": strategy,
-            "group_offload_use_stream": group_offload_use_stream,
-            "group_offload_low_cpu_mem": group_offload_low_cpu_mem,
-            "block_pin_auto_evict": block_pin_auto_evict,
-        }
-        explicit = {k: v for k, v in passed.items() if v is not _UNSET}
-        if explicit:
-            logger.warning(
-                "managed(): an existing ModelManager was supplied along with "
-                "configuration kwargs %s. These are ignored — the manager's "
-                "existing configuration is used. Configure the manager directly "
-                "if you want to change them.",
-                explicit,
-            )
+        logger.warning(
+            "managed(): an existing ModelManager was supplied along with "
+            "configuration kwargs %s. These are ignored — the manager's "
+            "existing configuration is used. Configure the manager directly "
+            "if you want to change them.",
+            explicit,
+        )
 
     if not hasattr(pipe, "components") or not isinstance(pipe.components, dict):
         raise TypeError(
