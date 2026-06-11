@@ -825,6 +825,27 @@ class ModelManager:
             logger.warning("auto: VRAM detection failed (%s)", e)
             return 0.0, 0.0
 
+    def _effective_free_vram_gb(self, device: torch.device | str) -> float:
+        """Free VRAM the *workload* can actually use, in GB.
+
+        ``mem_get_info`` reports the driver's free pages, which counts PyTorch's
+        caching-allocator reserved-but-unallocated pool as "used" even though
+        PyTorch will hand that memory back out without touching the driver. Once
+        the allocator's reserved pool grows over the first runs, driver-free
+        drops and the block_pin eviction check fires spuriously, thrashing the
+        pinned blocks CPU<->GPU every neighbor forward. Adding the reclaimable
+        pool (``reserved - allocated``) back gives the honest "how much can the
+        next op grab" figure and keeps eviction from triggering on warmed-up runs.
+        """
+        free_gb, _ = self._detect_available_vram_gb(device)
+        try:
+            reserved = torch.cuda.memory_reserved(device) / (1024**3)
+            allocated = torch.cuda.memory_allocated(device) / (1024**3)
+            reclaimable = max(0.0, reserved - allocated)
+        except Exception:
+            reclaimable = 0.0
+        return free_gb + reclaimable
+
     def _estimate_components_size_gb(self) -> tuple[float, float]:
         """Return ``(total_size_gb, max_component_size_gb)`` of registered components.
 
@@ -1242,12 +1263,13 @@ class ModelManager:
            that. This always wins.
         2. **No states** — if no pinned subset exists, there's nothing to
            evict; short-circuit before bothering with the VRAM query.
-        3. **Runtime VRAM check** — query ``mem_get_info`` for currently
-           free VRAM. If it's at or above the working-set margin the
+        3. **Runtime VRAM check** — query *effective* free VRAM
+           (``_effective_free_vram_gb``: driver-free + PyTorch's reclaimable
+           reserved pool). If it's at or above the working-set margin the
            auto-budget reserved (``_resolve_working_set_gb``), the neighbor
-           fits without evicting pinned: skip. Otherwise something has
-           consumed more than expected and we'd *want* to evict.
-           If VRAM detection fails (``free=0.0``) we fail safe and evict.
+           fits without evicting pinned: skip. Using effective (not driver)
+           free is what stops the warm-up thrash — the grown allocator pool
+           is reusable, not consumed. If detection fails (``0.0``) we evict.
         4. **Runtime RAM-absorb check** — if step 3 wants to evict, also
            verify the host can absorb the evicted subset without itself
            running out. Compare ``ram_available`` against
@@ -1274,7 +1296,7 @@ class ModelManager:
             return False
 
         sample_device = states[0].device
-        free_gb, _ = self._detect_available_vram_gb(sample_device)
+        free_gb = self._effective_free_vram_gb(sample_device)
         threshold_gb = self._resolve_working_set_gb()
         if free_gb >= threshold_gb:
             return False
@@ -1317,7 +1339,7 @@ class ModelManager:
             return
 
         sample_device = states_snapshot[0].device
-        free_gb, _ = self._detect_available_vram_gb(sample_device)
+        free_gb = self._effective_free_vram_gb(sample_device)
         threshold_gb = self._resolve_working_set_gb()
         with self._lock:
             override = self._evict_on_neighbor.get(neighbor_name) if neighbor_name else None

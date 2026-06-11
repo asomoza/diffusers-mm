@@ -2009,6 +2009,48 @@ class TestBlockPinAutoEvictConditional:
         # 1 GiB free < 6.5 GiB margin → evict.
         assert state.resident is False
 
+    def test_reclaimable_reserved_pool_prevents_warmup_thrash(self, monkeypatch):
+        # Driver reports only 1 GiB free (below the 6.5 GiB margin), but
+        # PyTorch holds an 8 GiB reserved-but-unallocated pool it will reuse
+        # without touching the driver. EFFECTIVE free = 1 + 8 = 9 ≥ margin, so
+        # eviction must be SKIPPED — this is the warm-up thrash the fix prevents.
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (1.0, 16.0))
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda d=None: 8 * 1024**3)
+        monkeypatch.setattr(torch.cuda, "memory_allocated", lambda d=None: 0)
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        assert state.resident is True
+        vae.decode(torch.zeros(4))
+        assert state.resident is True  # reclaimable pool covered the neighbor → no thrash
+
+    def test_tight_vram_with_no_reclaimable_pool_still_evicts(self, monkeypatch):
+        # Driver free low AND the reserved pool is fully allocated (nothing
+        # reclaimable), so effective free == driver free (1 GiB) < margin →
+        # eviction still fires. Confirms the fix doesn't suppress genuine pressure.
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_detect_available_vram_gb", lambda d: (1.0, 16.0))
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda d=None: 4 * 1024**3)
+        monkeypatch.setattr(torch.cuda, "memory_allocated", lambda d=None: 4 * 1024**3)
+        transformer = _FakeTransformer()
+        vae = _FakeVAE()
+        mm.register_component("transformer", transformer)
+        mm.register_component("vae", vae)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+
+        state = mm._block_pin_states["transformer"]
+        vae.decode(torch.zeros(4))
+        assert state.resident is False
+
     def test_set_evict_on_neighbor_true_forces_eviction(self, monkeypatch):
         _stub_group_offload(monkeypatch)
         mm = ModelManager(strategy="block_pin")
