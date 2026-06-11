@@ -1614,10 +1614,24 @@ class TestAutoResolutionPicksBlockPin:
         mm.register_component("transformer", self._make_with_blocks(num_blocks=4))
         assert mm.resolve_offload_strategy("cuda") == "group_offload"
 
-    def test_block_pin_skipped_when_model_offload_fits(self, monkeypatch):
-        # 24 GB VRAM, largest 10 GB → 10 × 1.5 = 15 ≤ 24 → model_offload
-        # wins even though a block list exists.
+    def test_prefers_block_pin_over_model_offload_when_fully_pinnable(self, monkeypatch):
+        # 24 GB VRAM, largest 10 GB with 16 blocks. model_offload would fit
+        # (10 × 1.5 = 15 ≤ 24), but block_pin can pin the WHOLE component
+        # (10 + working_set + per_block ≈ 17 ≤ 24) and keep it resident across
+        # runs — same VRAM peak, faster. block_pin wins.
         _patch_vram(monkeypatch, 24.0)
+        mm = ModelManager(strategy="auto")
+        mm._estimate_components_size_gb = lambda: (20.0, 10.0)
+        mm.register_component("transformer", self._make_with_blocks(num_blocks=16))
+        assert mm.resolve_offload_strategy("cuda") == "block_pin"
+
+    def test_keeps_model_offload_when_only_partial_pin(self, monkeypatch):
+        # 17 GB VRAM, largest 10 GB with 16 blocks. model_offload fits
+        # (10 × 1.5 = 15 ≤ 17), but block_pin could NOT fully pin it
+        # (10 + working_set(6.5/8.5) + per_block > 17), so the protective
+        # guard keeps model_offload rather than risk a partial pin that
+        # under-budgets activations.
+        _patch_vram(monkeypatch, 17.0)
         mm = ModelManager(strategy="auto")
         mm._estimate_components_size_gb = lambda: (20.0, 10.0)
         mm.register_component("transformer", self._make_with_blocks(num_blocks=16))

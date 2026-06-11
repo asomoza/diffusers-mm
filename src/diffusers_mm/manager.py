@@ -866,9 +866,15 @@ class ModelManager:
 
         - If pipeline weights × ``AUTO_NO_OFFLOAD_FACTOR`` ≤ available VRAM →
           ``no_offload`` (everything fits on GPU with activation headroom).
+        - Else if block_pin would pin the *entire* largest component on the GPU
+          (``_block_pin_would_fully_pin_largest``) → ``block_pin``. Same VRAM
+          peak as model_offload, but the transformer stays resident across runs
+          instead of being re-cycled each generation — faster for repeated use.
         - Else if largest component × ``AUTO_MODEL_OFFLOAD_FACTOR`` ≤
-          available VRAM → ``model_offload`` (one component swaps onto GPU
-          at a time).
+          available VRAM → ``model_offload`` (swap the largest on/off the GPU;
+          chosen when block_pin could only partially pin it).
+        - Else if the largest component has a usable repeated-block list →
+          ``block_pin`` (partial pin + stream the overflow).
         - Otherwise → ``group_offload`` (leaf-level streaming).
 
         If no components are registered yet, falls back to a tier table on
@@ -920,15 +926,23 @@ class ModelManager:
 
         if weights_gb * self.AUTO_NO_OFFLOAD_FACTOR <= vram_avail_gb:
             chosen = "no_offload"
+        elif self._block_pin_would_fully_pin_largest(device):
+            # The largest component (typically the transformer) fits entirely as
+            # pinned-resident blocks. block_pin then has the same VRAM peak as
+            # model_offload but keeps the transformer on the GPU across runs
+            # instead of bulk-cycling it every generation — strictly faster for
+            # repeated inference. Prefer it over model_offload here.
+            chosen = "block_pin"
         elif max_component_gb * self.AUTO_MODEL_OFFLOAD_FACTOR <= vram_avail_gb:
+            # Largest component fits on the GPU one-at-a-time but block_pin
+            # couldn't pin all of it (overflow would stream). Cycle it rather
+            # than risk a partial-pin that under-budgets activations on video.
             chosen = "model_offload"
         elif self._largest_component_has_block_list():
-            # Largest component (typically the transformer) won't fit
-            # under model_offload, but it has a long enough repeated-block
-            # list to do better than plain leaf-level streaming: pin as
-            # many blocks as VRAM allows, stream the rest. Components
-            # without a block list fall back to plain group_offload at
-            # apply time, so this is safe even in mixed pipelines.
+            # Largest component won't fit under model_offload, but it has a long
+            # enough repeated-block list to beat plain leaf-level streaming: pin
+            # as many blocks as VRAM allows, stream the rest. Components without
+            # a block list fall back to group_offload at apply time.
             chosen = "block_pin"
         else:
             chosen = "group_offload"
@@ -1127,18 +1141,18 @@ class ModelManager:
                 "starting Python."
             )
 
-    def _largest_component_has_block_list(self) -> bool:
-        """True if the largest registered component has a usable block list.
+    def _largest_block_list_info(self) -> tuple[nn.Module, str, Any] | None:
+        """Return ``(largest_component, block_attr, blocks)`` or ``None``.
 
-        "Usable" = at least :attr:`AUTO_BLOCK_PIN_MIN_BLOCKS` entries.
-        Below that threshold, per-block ``apply_group_offloading``
-        overhead outweighs the benefit and plain ``group_offload`` is
-        a better default.
+        Finds the largest registered component (by parameter bytes, deduped by
+        identity) and its largest repeated-block list. Shared by the block-list
+        check and the "would fully pin" check so they agree on which component
+        and block list they're reasoning about.
         """
         with self._lock:
             components = list(self._managed_components.values())
         if not components:
-            return False
+            return None
 
         seen_ids: set[int] = set()
         largest: nn.Module | None = None
@@ -1155,13 +1169,64 @@ class ModelManager:
                 largest_size = size
                 largest = mod
         if largest is None:
-            return False
+            return None
 
         result = find_largest_block_list(largest)
         if result is None:
+            return None
+        block_attr, blocks = result
+        return largest, block_attr, blocks
+
+    def _largest_component_has_block_list(self) -> bool:
+        """True if the largest registered component has a usable block list.
+
+        "Usable" = at least :attr:`AUTO_BLOCK_PIN_MIN_BLOCKS` entries.
+        Below that threshold, per-block ``apply_group_offloading``
+        overhead outweighs the benefit and plain ``group_offload`` is
+        a better default.
+        """
+        info = self._largest_block_list_info()
+        return info is not None and len(info[2]) >= self.AUTO_BLOCK_PIN_MIN_BLOCKS
+
+    def _block_pin_would_fully_pin_largest(self, device: torch.device | str) -> bool:
+        """True if block_pin would pin the *entire* largest component on the GPU.
+
+        This is the condition under which block_pin should be preferred over
+        model_offload: when every block fits resident, block_pin's VRAM peak
+        equals model_offload's (the whole transformer on GPU during its forward),
+        but it stays resident across runs instead of being re-transferred each
+        generation — strictly faster for repeated inference.
+
+        When it would only *partially* pin (overflow streamed), we deliberately
+        do NOT prefer it over a viable model_offload: the working-set margin is
+        calibrated for image diffusion and under-budgets long-video activations,
+        so a partial-pin auto-choice could overflow where model_offload wouldn't.
+
+        Mirrors the apply-time full-pin condition in ``_compute_block_pin_count``
+        (``avail - non_block - working_set - per_block >= block_total``), i.e.
+        ``avail >= max_component + working_set + per_block``. Uses the resolver's
+        injected/estimated sizes so the decision matches the size accounting the
+        rest of resolve_offload_strategy uses.
+        """
+        info = self._largest_block_list_info()
+        if info is None:
             return False
-        _, blocks = result
-        return len(blocks) >= self.AUTO_BLOCK_PIN_MIN_BLOCKS
+        _, _, blocks = info
+        n = len(blocks)
+        if n < self.AUTO_BLOCK_PIN_MIN_BLOCKS:
+            return False
+
+        _, max_component_gb = self._estimate_components_size_gb()
+        if max_component_gb <= 0:
+            return False
+        # Approximate per-block from the largest component / block count. This
+        # slightly over-estimates per_block (it folds in the non-block parts),
+        # making the threshold conservative: if we say "fully pins", the precise
+        # apply-time budget will too.
+        per_block_gb = max_component_gb / n
+        avail_gb, _ = self._detect_available_vram_gb(device)
+        working_set_gb = self._resolve_working_set_gb()
+        return avail_gb >= max_component_gb + working_set_gb + per_block_gb
 
     # ------------------------------------------------------------------
     # Block-pin auto-evict (cross-component coordination)

@@ -462,11 +462,14 @@ def test_ltx23_distilled_int8_vram24_ram32() -> None:
 def test_ltx23_distilled_int4_vram24_ram32() -> None:
     """24 GiB hard VRAM cap + 32 GiB injected RAM, LTX-2.3 distilled int4.
 
-    Auto picks ``model_offload``: the int4 transformer is 10.769 GiB,
-    so ``10.769 × 1.5 = 16.15 ≤ 24`` fits comfortably. Total pipeline
-    weights are 26.10 GiB, which is below the 32 GiB cap minus the
-    AUTO_RAM_HEADROOM (32 × 0.85 = 27.2), so no RAM-warning fires and
-    the workload should fit on host with a few GiB to spare.
+    Auto picks ``block_pin``: the int4 transformer is 10.769 GiB and
+    block_pin can pin the WHOLE component (10.769 + working_set + per_block
+    ≈ 17.5 ≤ 24), so it's preferred over model_offload — same VRAM peak but
+    resident across runs. (model_offload would also have fit at 10.769 ×
+    1.5 = 16.15 ≤ 24; block_pin is the faster equal-VRAM choice.) Total
+    pipeline weights are 26.10 GiB, below the 32 GiB cap minus the
+    AUTO_RAM_HEADROOM (32 × 0.85 = 27.2), so no RAM-warning fires and the
+    workload should fit on host with a few GiB to spare.
 
     A passing run confirms both halves of the simulated env: the real
     24 GiB VRAM cap (dummy reservation, OOM at ``cudaMalloc`` on

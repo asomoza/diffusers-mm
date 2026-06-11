@@ -26,6 +26,14 @@ ENVS: dict[str, tuple[float, float]] = {
     # Starting case: 24 GiB GPU on a 32 GiB system. Common consumer
     # workstation before Threadripper / 64 GiB kits became cheap.
     "vram24_ram32": (24.0, 32.0),
+    # Big card: the transformer fits fully pinned, so block_pin (resident
+    # across runs) should win over model_offload (re-cycles it each run).
+    "vram32_ram64": (32.0, 64.0),
+    # Tight card where the int4 transformer fits under model_offload's 1.5×
+    # check but block_pin could only PARTIALLY pin it (avail < weights +
+    # working_set). Locks in the protective guard: stay on model_offload here
+    # rather than risk a partial pin that under-budgets video activations.
+    "vram17_ram32": (17.0, 32.0),
 }
 
 
@@ -75,14 +83,25 @@ PROFILES: dict[str, Profile] = {
 # fails individually instead of silently shifting.
 EXPECTED_STRATEGY: dict[tuple[str, str], str] = {
     # 24 VRAM / 32 RAM + LTX-2.3 distilled int8:
-    #   total × 1.5 = 57.75 > 24    → not no_offload
-    #   max   × 1.5 = 27.80 > 24    → not model_offload (just barely)
-    #   48 blocks ≥ AUTO_BLOCK_PIN_MIN_BLOCKS=8  → block_pin
+    #   total × 1.5 = 57.75 > 24                       → not no_offload
+    #   fully-pin needs 18.535 + 6.5 + 0.39 = 25.4 > 24 → not fully-pin block_pin
+    #   max × 1.5 = 27.80 > 24                          → not model_offload
+    #   48 blocks ≥ 8                                   → block_pin (partial)
     ("vram24_ram32", "ltx23_distilled_sdnq_int8"): "block_pin",
     # 24 VRAM / 32 RAM + LTX-2.3 distilled int4:
-    #   total × 1.5 = 39.15 > 24    → not no_offload
-    #   max   × 1.5 = 16.15 ≤ 24    → model_offload fits
-    ("vram24_ram32", "ltx23_distilled_sdnq_int4"): "model_offload",
+    #   total × 1.5 = 39.15 > 24                        → not no_offload
+    #   fully-pin needs 10.769 + 6.5 + 0.22 = 17.5 ≤ 24 → block_pin (fully pinned).
+    #   Previously model_offload (max × 1.5 = 16.15 ≤ 24), but block_pin keeps
+    #   the transformer resident across runs, same VRAM peak, faster.
+    ("vram24_ram32", "ltx23_distilled_sdnq_int4"): "block_pin",
+    # 32 VRAM / 64 RAM: both quants fully pin → block_pin over model_offload.
+    #   int8 fully-pin needs 25.4 ≤ 32 (was model_offload: 27.8 ≤ 32).
+    #   int4 fully-pin needs 17.5 ≤ 32.
+    ("vram32_ram64", "ltx23_distilled_sdnq_int8"): "block_pin",
+    ("vram32_ram64", "ltx23_distilled_sdnq_int4"): "block_pin",
+    # 17 VRAM / 32 RAM + int4: model_offload viable (16.15 ≤ 17) but NOT
+    # fully-pinnable (17.5 > 17) → protective guard keeps model_offload.
+    ("vram17_ram32", "ltx23_distilled_sdnq_int4"): "model_offload",
 }
 
 
