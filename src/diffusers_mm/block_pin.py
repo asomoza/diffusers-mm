@@ -123,6 +123,38 @@ def repin_pinned_subset(state: BlockPinState) -> None:
     state.resident = True
 
 
+def unpin_blocks(state: BlockPinState, k: int, offload_kwargs: dict[str, Any]) -> int:
+    """Unpin the last *k* currently-pinned blocks of *state* — they start streaming.
+
+    Attaches per-block ``apply_group_offloading`` hooks (which offload them to
+    CPU on init) to blocks ``[n_pinned - k : n_pinned]`` and lowers
+    ``state.n_pinned``. Deliberately touches **only** those overflow block
+    submodules — not the top-level component, not the blocks that stay pinned —
+    so it is safe to call *between* denoising steps, including from a forward
+    hook on the component itself: it never mutates the top-level module's own
+    hook dict while that dict is being iterated.
+
+    Returns the number of blocks actually unpinned.
+    """
+    from diffusers.hooks.group_offloading import apply_group_offloading
+
+    blocks = getattr(state.component, state.block_attr, None)
+    if blocks is None:
+        return 0
+    n = state.n_pinned
+    k = max(0, min(k, n))
+    if k == 0:
+        return 0
+    for i in range(n - k, n):
+        apply_group_offloading(blocks[i], **offload_kwargs)
+    state.n_pinned = n - k
+    # Refresh the cached eviction footprint the auto-evict RAM check reads.
+    per_block = per_block_size_bytes(blocks)
+    non_block = non_block_size_bytes(state.component, state.block_attr)
+    state.pinned_size_bytes = state.n_pinned * per_block + non_block
+    return k
+
+
 def find_largest_block_list(module: nn.Module) -> tuple[str, nn.ModuleList] | None:
     """Return ``(attr_name, module_list)`` for the largest repeated-block list, or ``None``.
 

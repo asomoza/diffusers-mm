@@ -7,6 +7,7 @@ import contextvars
 import gc
 import hashlib
 import logging
+import math
 import sys
 import threading
 import weakref
@@ -24,9 +25,14 @@ from diffusers_mm.block_pin import (
     non_block_size_bytes,
     per_block_size_bytes,
     repin_pinned_subset,
+    unpin_blocks,
 )
 from diffusers_mm.hooks import remove_offload_hooks
+from diffusers_mm.inventory import ComponentInfo, build_inventory
 from diffusers_mm.modular_compat import ensure_modular_compat
+
+
+DENOISER_CONCURRENCY_MODES = ("co_resident", "sequential")
 
 
 logger = logging.getLogger(__name__)
@@ -155,6 +161,9 @@ class ModelManager:
         group_offload_use_stream: bool = True,
         group_offload_low_cpu_mem: bool = True,
         block_pin_auto_evict: bool = True,
+        denoiser_concurrency: str = "co_resident",
+        block_pin_spill_aware: bool = True,
+        block_pin_spill_margin_gb: float = 0.5,
         *,
         auto_no_offload_factor: float | None = None,
         auto_model_offload_factor: float | None = None,
@@ -290,6 +299,8 @@ class ModelManager:
         # (rare); otherwise the sentinel ``_INSTANCE_ATTR_ABSENT`` which
         # tells the unwrap step to ``delattr`` instead.
         self._block_pin_wrapped_methods: list[tuple[Any, str, Any]] = []
+        # Forward-hook handles for the step-1 spill calibration (Windows).
+        self._spill_calib_handles: list[Any] = []
         # Per-neighbor explicit override for the auto-evict decision.
         # ``True`` forces eviction on every call (paranoid mode); ``False``
         # disables it entirely for that component (e.g. text encoders that
@@ -303,6 +314,23 @@ class ModelManager:
         self._group_offload_use_stream: bool = bool(group_offload_use_stream)
         self._group_offload_low_cpu_mem: bool = bool(group_offload_low_cpu_mem)
         self._block_pin_auto_evict: bool = bool(block_pin_auto_evict)
+
+        # How to budget multiple denoisers (DiTs): "co_resident" sums them (both
+        # used every step, e.g. Ideogram4 True-CFG); "sequential" takes the max
+        # (one active at a time, e.g. Wan2.2 high/low-noise experts).
+        if denoiser_concurrency not in DENOISER_CONCURRENCY_MODES:
+            raise ValueError(
+                f"denoiser_concurrency must be one of {DENOISER_CONCURRENCY_MODES}, got {denoiser_concurrency!r}"
+            )
+        self.denoiser_concurrency: str = denoiser_concurrency
+
+        # Spill-aware block_pin: after a managed generation, if the caching
+        # allocator reserved more than the card's VRAM (Windows sysmem fallback
+        # / oversubscription), evict pinned blocks until it fits — self-tuning
+        # the pin count to just under the ceiling for the actual workload.
+        self._block_pin_spill_aware: bool = bool(block_pin_spill_aware)
+        self._block_pin_spill_margin_gb: float = float(block_pin_spill_margin_gb)
+        self._block_pin_spill_recalibrations: int = 0
 
         # Per-instance overrides for the auto-resolver constants. We
         # shadow the class attribute with an instance attribute only
@@ -877,6 +905,40 @@ class ModelManager:
                 max_bytes = size
         return total_bytes / (1024**3), max_bytes / (1024**3)
 
+    def classify_components(self) -> list[ComponentInfo]:
+        """Classify registered components by role (denoiser / text_encoder / vae / other).
+
+        Detects how many denoisers and text encoders a pipeline has and their
+        sizes — the inputs the size-aware resolver and block_pin budgeting need
+        for multi-DiT / multi-text-encoder pipelines. See ``inventory.py``.
+        """
+        with self._lock:
+            components = dict(self._managed_components)
+        return build_inventory(components, self.AUTO_BLOCK_PIN_MIN_BLOCKS)
+
+    def _concurrent_working_set_gb(self) -> float:
+        """Peak concurrently-resident weight footprint (GiB), by role.
+
+        - Denoisers: summed if ``denoiser_concurrency == "co_resident"`` (both
+          DiTs live every step), else the largest single one ("sequential").
+        - Text encoders: largest single one (they run sequentially pre-denoise).
+        - Other (VAE, etc.): largest single one.
+
+        The peak is the max across roles. Replaces the old "largest single
+        component" figure in the ``model_offload`` tier, which under-budgeted
+        co-resident dual-DiT pipelines and let them spill to RAM.
+        """
+        inventory = self.classify_components()
+        denoisers = [c.size_gb for c in inventory if c.role == "denoiser"]
+        text_encoders = [c.size_gb for c in inventory if c.role == "text_encoder"]
+        others = [c.size_gb for c in inventory if c.role in ("vae", "other")]
+
+        if self.denoiser_concurrency == "co_resident":
+            denoiser_ws = sum(denoisers)
+        else:
+            denoiser_ws = max(denoisers, default=0.0)
+        return max(denoiser_ws, max(text_encoders, default=0.0), max(others, default=0.0), 0.0)
+
     def resolve_offload_strategy(self, device: torch.device | str) -> str:
         """Resolve ``"auto"`` to a concrete strategy based on hardware + workload.
 
@@ -923,6 +985,11 @@ class ModelManager:
 
         ram_avail_gb, ram_total_gb = self._detect_available_ram_gb()
         weights_gb, max_component_gb = self._estimate_components_size_gb()
+        # Peak concurrently-resident weights (sums co-resident denoisers), which
+        # is what model_offload actually holds on the GPU — not the single
+        # largest component. Falls back to max_component if classification finds
+        # nothing (e.g. a single-component pipeline).
+        concurrent_ws_gb = max(self._concurrent_working_set_gb(), max_component_gb)
 
         if weights_gb == 0:
             # No components registered yet — fall back to a tier table on
@@ -958,10 +1025,13 @@ class ModelManager:
             # instead of bulk-cycling it every generation — strictly faster for
             # repeated inference. Prefer it over model_offload here.
             chosen = "block_pin"
-        elif max_component_gb * self.AUTO_MODEL_OFFLOAD_FACTOR <= vram_avail_gb:
-            # Largest component fits on the GPU one-at-a-time but block_pin
-            # couldn't pin all of it (overflow would stream). Cycle it rather
-            # than risk a partial-pin that under-budgets activations on video.
+        elif concurrent_ws_gb * self.AUTO_MODEL_OFFLOAD_FACTOR <= vram_avail_gb:
+            # The concurrent working set (all co-resident denoisers) fits on the
+            # GPU but block_pin couldn't pin it all (overflow would stream).
+            # Cycle it rather than risk a partial-pin that under-budgets
+            # activations on video. Using the summed working set here (not the
+            # single largest) stops dual-DiT True-CFG pipelines from picking
+            # model_offload and then spilling both DiTs + activations to RAM.
             chosen = "model_offload"
         elif self._largest_component_has_block_list():
             # Largest component won't fit under model_offload, but it has a long
@@ -973,13 +1043,16 @@ class ModelManager:
             chosen = "group_offload"
 
         logger.info(
-            "auto: vram=%.1f / %.1f GB, ram=%.1f / %.1f GB, pipeline=%.1f GB (largest component %.1f GB) → %s",
+            "auto: vram=%.1f / %.1f GB, ram=%.1f / %.1f GB, pipeline=%.1f GB "
+            "(largest %.1f GB, concurrent working set %.1f GB, denoiser_concurrency=%s) → %s",
             vram_avail_gb,
             vram_total_gb,
             ram_avail_gb,
             ram_total_gb,
             weights_gb,
             max_component_gb,
+            concurrent_ws_gb,
+            self.denoiser_concurrency,
             chosen,
         )
 
@@ -1038,6 +1111,161 @@ class ModelManager:
     # ------------------------------------------------------------------
     # Block-pin (selective offload) — public override + auto budget
     # ------------------------------------------------------------------
+
+    # Cap on how many times spill-aware recalibration will evict-and-repin in a
+    # session. Eviction is monotonic (only reduces pins) and converges in 1–2
+    # rounds; the cap is a backstop against oscillation.
+    _BLOCK_PIN_MAX_SPILL_RECALIBRATIONS = 3
+
+    def _maybe_recalibrate_block_pin_spill(self, device: torch.device | str) -> None:
+        """Evict pinned blocks if the last generation oversubscribed VRAM.
+
+        Called after a managed ``pipe(...)`` under ``block_pin``. If the caching
+        allocator reserved more than the card's total VRAM (minus a margin), the
+        workload spilled into shared/host memory (Windows sysmem fallback) — slow
+        and OOM-prone. We free that overage by unpinning blocks (which then
+        stream instead), landing the pin count just under the ceiling for the
+        real activation footprint. Self-tunes to any resolution/model/card,
+        replacing the fragile static working-set reserve as the spill guard.
+        """
+        if not self._block_pin_spill_aware or self._applied_strategy != "block_pin":
+            return
+        # VRAM oversubscription (reserved > total, backed by shared host memory) is
+        # a Windows sysmem-fallback behaviour. On Linux the allocator hard-OOMs
+        # instead, and the auto budget (which this library was tuned on) already
+        # fits — so recalibration is a no-op there.
+        if sys.platform != "win32":
+            return
+        if not torch.cuda.is_available():
+            return
+        dev = torch.device(device) if isinstance(device, str) else device
+        if dev.type != "cuda":
+            return
+        if self._block_pin_spill_recalibrations >= self._BLOCK_PIN_MAX_SPILL_RECALIBRATIONS:
+            return
+
+        try:
+            total_gb = torch.cuda.get_device_properties(dev).total_memory / (1024**3)
+            reserved_gb = torch.cuda.memory_reserved(dev) / (1024**3)
+        except Exception:
+            return
+
+        target_gb = total_gb - self._block_pin_spill_margin_gb
+        if reserved_gb <= target_gb:
+            return  # No spill — nothing to do.
+
+        with self._lock:
+            pinned = [(name, st) for name, st in self._block_pin_states.items() if st.n_pinned > 0]
+        if not pinned:
+            logger.warning(
+                "block_pin: reserved %.1f GB > %.1f GB target but no pinned blocks to evict "
+                "(spill is from activations alone). Consider a lower resolution or group_offload.",
+                reserved_gb,
+                target_gb,
+            )
+            self._block_pin_spill_recalibrations += 1  # don't retry a lost cause every call
+            return
+
+        # Free the overage plus a little slack so we land under the ceiling.
+        need_gb = (reserved_gb - target_gb) + self._block_pin_spill_margin_gb
+        pinned.sort(key=lambda item: item[1].n_pinned, reverse=True)
+
+        offload_kwargs = self._group_offload_kwargs(dev)
+        freed_gb = 0.0
+        evicted_total = 0
+        for name, st in pinned:
+            if freed_gb >= need_gb:
+                break
+            blocks = getattr(st.component, st.block_attr, None)
+            if blocks is None or len(blocks) == 0:
+                continue
+            per_block_gb = per_block_size_bytes(blocks) / (1024**3)
+            if per_block_gb <= 0:
+                continue
+            k = math.ceil((need_gb - freed_gb) / per_block_gb)
+            old_n = st.n_pinned
+            # Targeted, in-place unpin: only the overflow block submodules gain
+            # streaming hooks — the top-level component's own hooks (incl. the
+            # step-1 calibration hook that may be calling us) are untouched, so
+            # this is safe to run mid-generation between denoising steps.
+            actually = unpin_blocks(st, k, offload_kwargs)
+            if actually == 0:
+                continue
+            # Persist the calibrated count so any later full re-apply reproduces it.
+            with self._lock:
+                self._block_pin_counts[name] = st.n_pinned
+            freed_gb += actually * per_block_gb
+            evicted_total += actually
+            logger.info("block_pin spill: %s %d → %d pinned blocks", name, old_n, st.n_pinned)
+
+        if evicted_total == 0:
+            return
+
+        logger.info(
+            "block_pin spill-aware recalibration #%d: reserved %.1f GB > %.1f GB target, "
+            "unpinned ~%d blocks (~%.1f GB).",
+            self._block_pin_spill_recalibrations + 1,
+            reserved_gb,
+            target_gb,
+            evicted_total,
+            freed_gb,
+        )
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._block_pin_spill_recalibrations += 1
+
+    def _install_spill_calibration_hook(self, device: torch.device | str) -> None:
+        """Register forward hooks that recalibrate after the first denoise step.
+
+        The activation peak is reached on the first denoising step (every step
+        runs the same-shaped forward), so we don't need a whole generation to
+        know whether the pin count spills — one full step is enough. This is
+        pipeline-agnostic (a module forward hook fires on standard *and* modular
+        pipelines, unlike ``callback_on_step_end`` which modular lacks).
+
+        Windows-only, and a no-op unless ``block_pin`` is active with pinned
+        denoisers. Fires the (targeted, mid-generation-safe) recalibration once,
+        after each pinned denoiser has run one forward. The end-of-call check
+        remains as a safety net for any residual spill.
+        """
+        if not self._block_pin_spill_aware or sys.platform != "win32":
+            return
+        if self._applied_strategy != "block_pin":
+            return
+
+        with self._lock:
+            denoisers = [st.component for st in self._block_pin_states.values() if st.n_pinned > 0]
+            # Remove any stale calibration hooks from a prior apply.
+            for handle in self._spill_calib_handles:
+                handle.remove()
+            self._spill_calib_handles = []
+        if not denoisers:
+            return
+
+        n_expected = len(denoisers)  # ~one forward per pinned denoiser per step
+        fired = {"count": 0, "done": False}
+
+        def _calib_hook(module, args, output):
+            if fired["done"]:
+                return
+            fired["count"] += 1
+            if fired["count"] < n_expected:
+                return
+            fired["done"] = True
+            # Do NOT remove hooks here — mutating the module's hook dict while it
+            # is being iterated (we're inside a forward hook) is unsafe. The
+            # ``done`` flag makes further fires no-ops; handles are cleared on the
+            # next apply / strategy transition. The recalibration itself only
+            # touches overflow block submodules, so it is safe from here.
+            try:
+                self._maybe_recalibrate_block_pin_spill(device)
+            except Exception as e:  # never let calibration break a generation
+                logger.warning("block_pin step-1 spill calibration failed: %s", e)
+
+        handles = [comp.register_forward_hook(_calib_hook) for comp in denoisers]
+        with self._lock:
+            self._spill_calib_handles = handles
 
     def set_block_pin_count(self, component_name: str, count: int) -> None:
         """Override the number of blocks to pin on GPU for *component_name*.
@@ -1538,6 +1766,8 @@ class ModelManager:
         with self._lock:
             handles = list(self._block_pin_hook_handles)
             self._block_pin_hook_handles.clear()
+            handles += list(self._spill_calib_handles)
+            self._spill_calib_handles = []
             wrapped = list(self._block_pin_wrapped_methods)
             self._block_pin_wrapped_methods.clear()
             states = list(self._block_pin_states.values())
@@ -1789,6 +2019,9 @@ class ModelManager:
                     logger.warning("block_pin: failed for %s: %s", name, e)
 
             self._install_block_pin_auto_evict(new_pinned, new_neighbors, device_obj)
+            # Windows: probe VRAM after the first denoise step and unpin if it
+            # oversubscribes, instead of waiting for the whole (slow) generation.
+            self._install_spill_calibration_hook(device_obj)
 
         with self._lock:
             for name, _ in unique:

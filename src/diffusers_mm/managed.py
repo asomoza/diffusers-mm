@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from functools import wraps
 from typing import Any
 
 import torch
@@ -31,6 +30,9 @@ def managed(
     group_offload_use_stream: bool = _UNSET,
     group_offload_low_cpu_mem: bool = _UNSET,
     block_pin_auto_evict: bool = _UNSET,
+    denoiser_concurrency: str = _UNSET,
+    block_pin_spill_aware: bool = _UNSET,
+    block_pin_spill_margin_gb: float = _UNSET,
     auto_no_offload_factor: float = _UNSET,
     auto_model_offload_factor: float = _UNSET,
     auto_ram_headroom: float = _UNSET,
@@ -88,6 +90,21 @@ def managed(
             component's next forward fires. Frees several GiB of VRAM
             during VAE decode at the cost of two extra CPU↔GPU transfers
             per inference (typically 1–2 s on PCIe 4). Default True.
+        denoiser_concurrency: How to budget pipelines with multiple denoisers
+            (DiTs). ``"co_resident"`` (default) sums their sizes — correct when
+            both run every step (e.g. Ideogram4 conditional + unconditional
+            under True-CFG). ``"sequential"`` takes the largest single one —
+            correct when only one is active at a time (e.g. Wan2.2 high/low-noise
+            experts split by timestep). Wrong-way ``sequential`` on a
+            co-resident pipeline under-budgets and can spill to RAM.
+        block_pin_spill_aware: When ``block_pin`` is active, check after each
+            managed generation whether the caching allocator reserved more than
+            the card's VRAM (oversubscription / Windows sysmem fallback) and, if
+            so, evict pinned blocks until it fits. Self-tunes the pin count to
+            just under the memory ceiling for the actual workload. Default True.
+        block_pin_spill_margin_gb: Headroom (GiB) kept below total VRAM when
+            deciding whether the last run spilled and how much to evict.
+            Default ``0.5``.
         auto_no_offload_factor: Activation margin for the ``no_offload``
             auto tier (``pipeline_weights × this`` must fit in VRAM).
             Default ``1.5``.
@@ -129,6 +146,9 @@ def managed(
         "group_offload_use_stream": group_offload_use_stream,
         "group_offload_low_cpu_mem": group_offload_low_cpu_mem,
         "block_pin_auto_evict": block_pin_auto_evict,
+        "denoiser_concurrency": denoiser_concurrency,
+        "block_pin_spill_aware": block_pin_spill_aware,
+        "block_pin_spill_margin_gb": block_pin_spill_margin_gb,
         "auto_no_offload_factor": auto_no_offload_factor,
         "auto_model_offload_factor": auto_model_offload_factor,
         "auto_ram_headroom": auto_ram_headroom,
@@ -170,14 +190,32 @@ def managed(
 
     mm.apply_offload_strategy(device)
 
-    original_call = pipe.__call__
+    # Wrap __call__ at the TYPE level, not the instance. `pipe(...)` resolves
+    # `__call__` on type(pipe), so an instance attribute (`pipe.__call__ = ...`)
+    # is silently bypassed by call syntax. We install the wrapper on a per-pipe
+    # dynamic subclass instead. The wrapper scopes device/dtype for the call and,
+    # afterward, lets the manager evict pinned blocks if the run oversubscribed
+    # VRAM (spill-aware block_pin).
+    cls = type(pipe)
+    if not getattr(cls, "_diffusers_mm_wrapped", False):
+        base_call = cls.__call__
 
-    @wraps(original_call)
-    def wrapped_call(*args: Any, **kwargs: Any) -> Any:
-        with mm.device_scope(device=device, dtype=dtype):
-            return original_call(*args, **kwargs)
+        def _managed_call(self, *args: Any, __base_call=base_call, **kwargs: Any) -> Any:
+            _mm = getattr(self, "mm", None)
+            dev = getattr(self, "_diffusers_mm_device", None)
+            if _mm is None or dev is None:
+                return __base_call(self, *args, **kwargs)
+            with _mm.device_scope(device=dev, dtype=getattr(self, "_diffusers_mm_dtype", None)):
+                result = __base_call(self, *args, **kwargs)
+            _mm._maybe_recalibrate_block_pin_spill(dev)
+            return result
 
-    pipe.__call__ = wrapped_call  # type: ignore[method-assign]
+        # Reuse the original class name so repr / save_pretrained are unaffected.
+        managed_cls = type(cls.__name__, (cls,), {"__call__": _managed_call, "_diffusers_mm_wrapped": True})
+        pipe.__class__ = managed_cls  # type: ignore[assignment]
+
+    pipe._diffusers_mm_device = device  # type: ignore[attr-defined]
+    pipe._diffusers_mm_dtype = dtype  # type: ignore[attr-defined]
     pipe.mm = mm  # type: ignore[attr-defined]
 
     logger.info(
