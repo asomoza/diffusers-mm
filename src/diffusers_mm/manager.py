@@ -26,6 +26,7 @@ from diffusers_mm.block_pin import (
     repin_pinned_subset,
 )
 from diffusers_mm.hooks import remove_offload_hooks
+from diffusers_mm.modular_compat import ensure_modular_compat
 
 
 logger = logging.getLogger(__name__)
@@ -524,6 +525,9 @@ class ModelManager:
             components = source
         elif hasattr(source, "components") and isinstance(source.components, dict):
             components = source.components
+            # Modular pipelines' _execution_device doesn't detect group-offload
+            # onload devices; patch it so group_offload/block_pin work on them.
+            ensure_modular_compat(source)
         else:
             raise TypeError(
                 f"register_components expected a pipeline (with .components) or a dict, got {type(source).__name__}"
