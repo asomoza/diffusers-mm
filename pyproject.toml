@@ -1,6 +1,6 @@
 [project]
 name = "diffusers-mm"
-version = "0.2.1"
+version = "0.3.0"
 description = "Smart model management for Hugging Face Diffusers pipelines"
 readme = "README.md"
 license = "Apache-2.0"
