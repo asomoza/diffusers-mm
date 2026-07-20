@@ -979,6 +979,23 @@ class ModelManager:
             denoiser_ws = max(denoisers, default=0.0)
         return max(denoiser_ws, max(text_encoders, default=0.0), max(others, default=0.0), 0.0)
 
+    def _coresident_denoiser_count(self) -> int:
+        """Number of denoisers that must be resident together every denoise step.
+
+        ``model_offload``'s accelerate chain keeps at most **one** chained
+        component on the GPU at a time — each component's forward offloads the
+        previous. So it structurally cannot co-reside two denoisers that both
+        run every step (e.g. Ideogram4 True-CFG's conditional +
+        unconditional transformers): it would bulk-swap a multi-GB DiT
+        CPU↔GPU on *every* step. Returns the denoiser count only under
+        ``denoiser_concurrency == "co_resident"``; ``"sequential"`` denoisers
+        (e.g. Wan2.2 high/low-noise experts split by timestep) are swapped one
+        at a time, which model_offload handles fine, so this returns 0 there.
+        """
+        if self.denoiser_concurrency != "co_resident":
+            return 0
+        return sum(1 for c in self.classify_components() if c.role == "denoiser")
+
     def resolve_offload_strategy(self, device: torch.device | str) -> str:
         """Resolve ``"auto"`` to a concrete strategy based on hardware + workload.
 
@@ -997,7 +1014,13 @@ class ModelManager:
           (``_block_pin_would_fully_pin_largest``) → ``block_pin``. Same VRAM
           peak as model_offload, but the transformer stays resident across runs
           instead of being re-cycled each generation — faster for repeated use.
-        - Else if largest component × ``AUTO_MODEL_OFFLOAD_FACTOR`` ≤
+        - Else if ≥2 denoisers are co-resident every step (True-CFG's
+          conditional + unconditional DiTs, ``denoiser_concurrency ==
+          "co_resident"``) → ``block_pin`` (or ``group_offload`` if no block
+          list). ``model_offload`` is skipped here: its chain holds only one
+          component on the GPU at a time, so it can't co-reside them and would
+          swap a multi-GB DiT CPU↔GPU every step.
+        - Else if concurrent working set × ``AUTO_MODEL_OFFLOAD_FACTOR`` ≤
           available VRAM → ``model_offload`` (swap the largest on/off the GPU;
           chosen when block_pin could only partially pin it).
         - Else if the largest component has a usable repeated-block list →
@@ -1030,6 +1053,10 @@ class ModelManager:
         # largest component. Falls back to max_component if classification finds
         # nothing (e.g. a single-component pipeline).
         concurrent_ws_gb = max(self._concurrent_working_set_gb(), max_component_gb)
+        # model_offload can't co-reside ≥2 denoisers that run every step (its
+        # chain holds one component at a time); picking it there thrashes a DiT
+        # CPU↔GPU per step. Count them so the model_offload tier can be skipped.
+        coresident_denoisers = self._coresident_denoiser_count()
 
         if weights_gb == 0:
             # No components registered yet — fall back to a tier table on
@@ -1071,6 +1098,15 @@ class ModelManager:
             # instead of bulk-cycling it every generation — strictly faster for
             # repeated inference. Prefer it over model_offload here.
             chosen = "block_pin"
+        elif coresident_denoisers >= 2:
+            # ≥2 denoisers run every step (True-CFG conditional + unconditional).
+            # model_offload's chain can only hold one component resident at a
+            # time, so it cannot co-reside them — it would bulk-swap a multi-GB
+            # DiT CPU↔GPU on every step. Skip the model_offload tier entirely and
+            # fall through to block_pin (pin what fits, stream the rest) or
+            # group_offload (leaf-level streaming), both of which keep the DiT
+            # weights resident/streamed without a per-step full-component swap.
+            chosen = "block_pin" if self._largest_component_has_block_list() else "group_offload"
         elif concurrent_ws_gb * self.AUTO_MODEL_OFFLOAD_FACTOR <= vram_avail_gb:
             # The concurrent working set (all co-resident denoisers) fits on the
             # GPU but block_pin couldn't pin it all (overflow would stream).
@@ -1090,7 +1126,8 @@ class ModelManager:
 
         logger.info(
             "auto: vram=%.1f / %.1f GB, ram=%.1f / %.1f GB, pipeline=%.1f GB "
-            "(largest %.1f GB, concurrent working set %.1f GB, denoiser_concurrency=%s) → %s",
+            "(largest %.1f GB, concurrent working set %.1f GB, "
+            "denoiser_concurrency=%s, co-resident denoisers=%d) → %s",
             vram_avail_gb,
             vram_total_gb,
             ram_avail_gb,
@@ -1099,6 +1136,7 @@ class ModelManager:
             max_component_gb,
             concurrent_ws_gb,
             self.denoiser_concurrency,
+            coresident_denoisers,
             chosen,
         )
 

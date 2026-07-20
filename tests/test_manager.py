@@ -979,6 +979,66 @@ class TestAutoResolutionSized:
         assert mm.resolve_offload_strategy("cuda") == "group_offload"
 
 
+class _BlockyDenoiser(nn.Module):
+    """Stand-in denoiser with a repeated-block ``ModuleList``.
+
+    Named ``transformer`` / ``unconditional_transformer`` at registration so
+    the inventory classifies it as a denoiser, and carries a real block list
+    so the block-list resolver branch can fire. Tiny 2×2 blocks — the resolver
+    branches on the injected sizes, not these.
+    """
+
+    def __init__(self, n_blocks: int = 16) -> None:
+        super().__init__()
+        self.transformer_blocks = nn.ModuleList(nn.Linear(2, 2) for _ in range(n_blocks))
+
+
+class TestCoResidentDenoiserGuard:
+    """auto must not pick model_offload when ≥2 denoisers are co-resident.
+
+    model_offload's accelerate chain holds one component on the GPU at a time,
+    so it can't co-reside two denoisers that both run every step (True-CFG's
+    conditional + unconditional DiTs) — it would bulk-swap a DiT CPU↔GPU per
+    step. All three tests share an env that resolves to model_offload for a
+    single/sequential denoiser (vram 16, sizes (20, 10): no_offload fails at
+    20+8>16, block_pin can't fully pin at 10+8+0.6>16, model_offload viable at
+    10×1.5≤16), so the only variable is the co-resident denoiser count.
+    """
+
+    def _mm(self, monkeypatch, *, denoiser_concurrency="co_resident"):
+        _patch_vram(monkeypatch, 16.0)
+        mm = ModelManager(strategy="auto", denoiser_concurrency=denoiser_concurrency)
+        mm._estimate_components_size_gb = lambda: (20.0, 10.0)
+        return mm
+
+    def test_two_coresident_denoisers_skip_model_offload(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+        mm.register_component("transformer", _BlockyDenoiser())
+        mm.register_component("unconditional_transformer", _BlockyDenoiser())
+        # Sanity: both are seen as co-resident denoisers.
+        assert mm._coresident_denoiser_count() == 2
+        # model_offload would otherwise win here; the guard redirects to
+        # block_pin (both denoisers expose a block list).
+        assert mm.resolve_offload_strategy("cuda") == "block_pin"
+
+    def test_sequential_denoisers_still_allow_model_offload(self, monkeypatch):
+        # Same two denoisers, but declared sequential (e.g. Wan2.2 experts) —
+        # only one is active at a time, which model_offload handles, so the
+        # guard must NOT fire (count reported as 0).
+        mm = self._mm(monkeypatch, denoiser_concurrency="sequential")
+        mm.register_component("transformer", _BlockyDenoiser())
+        mm.register_component("unconditional_transformer", _BlockyDenoiser())
+        assert mm._coresident_denoiser_count() == 0
+        assert mm.resolve_offload_strategy("cuda") == "model_offload"
+
+    def test_single_denoiser_still_allows_model_offload(self, monkeypatch):
+        # One denoiser co-resident with itself is fine for model_offload.
+        mm = self._mm(monkeypatch)
+        mm.register_component("transformer", _BlockyDenoiser())
+        assert mm._coresident_denoiser_count() == 1
+        assert mm.resolve_offload_strategy("cuda") == "model_offload"
+
+
 class TestRamDetection:
     def test_psutil_returns_positive(self):
         mm = ModelManager()
