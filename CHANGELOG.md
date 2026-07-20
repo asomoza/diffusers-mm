@@ -5,6 +5,23 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-07-20
+
+### Fixed
+- `auto` no longer picks `model_offload` for pipelines with **two or more
+  co-resident denoisers** (e.g. Ideogram4 True-CFG's conditional +
+  unconditional transformers). `model_offload`'s accelerate chain holds only one
+  component on the GPU at a time, so it cannot co-reside them and would bulk-swap
+  a multi-GB DiT CPU↔GPU on every denoise step. The resolver now skips the
+  `model_offload` tier there and uses `block_pin` (or `group_offload` when there
+  is no block list). Only applies under `denoiser_concurrency="co_resident"`.
+- block_pin auto-resolution now targets the largest **block-bearing** component
+  instead of the largest component overall. Pipelines whose heaviest component
+  has no top-level block list (e.g. a text encoder marginally larger than each
+  transformer, or a denoiser whose blocks are nested rather than top-level) now
+  correctly resolve to `block_pin` and pin the denoiser's blocks, instead of
+  bailing to `group_offload`.
+
 ## [0.3.0] - 2026-07-20
 
 ### Changed
@@ -96,6 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hash-keyed component cache and `remove_offload_hooks()` fix for diffusers'
   submodule hook-traversal bug.
 
+[0.3.1]: https://github.com/asomoza/diffusers-mm/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/asomoza/diffusers-mm/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/asomoza/diffusers-mm/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/asomoza/diffusers-mm/compare/v0.1.0...v0.2.0
