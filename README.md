@@ -73,11 +73,21 @@ Override the per-component count explicitly when the auto budget is wrong for yo
 pipe.mm.set_block_pin_count("transformer", 30)
 ```
 
-For long-video workloads the default working-set margin (`6.5 GiB`) can be undersized — set it on the manager via the ctor (see [Tuning the auto resolver](#tuning-the-auto-resolver) below):
+**Workload-aware working set.** The VRAM reserved per block_pin component for denoise activations scales with the actual job rather than a flat constant. Record the workload before the strategy is resolved so the auto-budget pins the right number of blocks:
 
 ```python
-pipe = managed(pipe, auto_block_pin_working_set_gb=12.0)  # video at 768x512x121f
+from diffusers_mm import block_pin_activation_scale
+
+mm = ModelManager()
+# seq_len = latent_frames * latent_h * latent_w; batch = 2 under CFG.
+mm.set_block_pin_workload(
+    seq_len=24 * 16 * 24, batch=2,
+    activation_scale=block_pin_activation_scale(lora_count=1, video_cond=True),
+)
+pipe = managed(pipe, mm=mm)  # resolver now reserves a workload-sized working set
 ```
+
+The reserve is `activation_estimate(seq_len, batch) × safety + platform_headroom`, where the activation estimate is a linear fit measured on a video DiT (bf16 activations, so it generalises across int4/int8/bf16). When no workload is recorded it falls back to a fixed estimate. The platform-headroom knobs (`auto_block_pin_working_set_gb`, default `2.0` GiB Linux / `3.0` Windows) sit on top of this and rarely need changing — in releases ≤ 0.2.x they *were* the entire flat margin (`6.5`/`8.5`).
 
 For `block_pin` to budget tightly, set the env var before starting Python:
 
@@ -89,7 +99,7 @@ Without it, allocator fragmentation can eat ~1-2 GiB and a careful budget can OO
 
 ### Tuning the auto resolver
 
-Every threshold the `"auto"` strategy uses internally is also a constructor argument on `ModelManager` (and a `managed()` kwarg). The defaults are tuned for image diffusion on consumer hardware — bump them for unusual workloads (high-activation video, very RAM-tight machines, etc.). All eight are keyword-only:
+Every threshold the `"auto"` strategy uses internally is also a constructor argument on `ModelManager` (and a `managed()` kwarg). The defaults are tuned for image diffusion on consumer hardware — bump them for unusual workloads (high-activation video, very RAM-tight machines, etc.). All are keyword-only:
 
 ```python
 pipe = managed(
@@ -104,9 +114,17 @@ pipe = managed(
     auto_low_cpu_mem_ram_headroom_gb=16.0,     # flip group_offload's low_cpu_mem=False if RAM ≥ weights + this
 
     # --- block_pin VRAM budget ---
-    auto_block_pin_working_set_gb=6.5,         # reserved VRAM per component (Linux/macOS); bump for video
-    auto_block_pin_working_set_windows_gb=8.5, # same, Windows (allocator runs in fixed-segment mode)
+    # The working set is now workload-aware (see set_block_pin_workload). These
+    # two are the platform safety headroom added on top of the activation estimate.
+    auto_block_pin_working_set_gb=2.0,         # headroom per component (Linux/macOS)
+    auto_block_pin_working_set_windows_gb=3.0, # same, Windows (allocator runs in fixed-segment mode)
     auto_block_pin_ram_evict_headroom_gb=4.0,  # auto-evict only if RAM ≥ evicted_subset + this
+
+    # --- block_pin activation fit (workload-aware working set) ---
+    auto_block_pin_act_intercept_gb=0.30,         # base activation at seq_len→0
+    auto_block_pin_act_slope_gb_per_ktoken=0.118, # +GiB per 1000 (batch × seq_len) tokens
+    auto_block_pin_act_safety_factor=1.5,         # multiplier before adding headroom
+    auto_block_pin_act_fallback_gb=4.0,           # estimate used when no workload recorded
 )
 ```
 
@@ -118,10 +136,12 @@ Each knob in detail:
 | `auto_model_offload_factor` | 1.5 | Largest component runs into VRAM ceiling at peak — push toward `block_pin` / `group_offload`. | Same direction as above, just for the per-component tier. |
 | `auto_ram_headroom` | 0.85 | RAM is tight and you want the "won't fit" warning to fire earlier. | RAM is plentiful and the warning is noisy. |
 | `auto_low_cpu_mem_ram_headroom_gb` | 16.0 | RAM-constrained system, prefer staying in low-RAM mode (slower steady-state but stable). | RAM-rich system, bias toward `low_cpu_mem=False` for faster transfers. |
-| `auto_block_pin_working_set_gb` | 6.5 | **Long video** at meaningful resolution (LTX-2.3 768×512×121f measures 10–14 GiB). | You've measured your specific workload below the default and want to pin more blocks. |
-| `auto_block_pin_working_set_windows_gb` | 8.5 | Same as above, on Windows. | Same. |
+| `auto_block_pin_working_set_gb` | 2.0 | Allocator fragmentation / attention overhead is unusually high (the workload-aware estimate already covers normal activations). | Rarely — it's just platform headroom now. |
+| `auto_block_pin_working_set_windows_gb` | 3.0 | Same as above, on Windows. | Same. |
 | `auto_block_pin_min_blocks` | 8 | Your block list is small enough that per-block hook overhead dominates. | You want `block_pin` even for shallow transformers (rarely useful). |
 | `auto_block_pin_ram_evict_headroom_gb` | 4.0 | Neighbors have unusually large host-side staging (large pinned buffers, big activations). | Neighbors are lightweight and you want eviction to fire more readily. |
+| `auto_block_pin_act_slope_gb_per_ktoken` | 0.118 | Your pipeline's activations grow faster with sequence length than the measured video-DiT fit. | Activations are flatter (e.g. heavily windowed attention). |
+| `auto_block_pin_act_fallback_gb` | 4.0 | You can't call `set_block_pin_workload` and your typical job has large activations. | Typical job is small and you want more blocks pinned by default. |
 
 These can also be set after construction by assigning the matching ALL_CAPS attribute on the manager — e.g. `pipe.mm.AUTO_BLOCK_PIN_WORKING_SET_GB = 12.0`. The ctor arg is shorthand for "do that at construction time."
 

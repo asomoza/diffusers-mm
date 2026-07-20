@@ -41,6 +41,10 @@ def managed(
     auto_block_pin_working_set_windows_gb: float = _UNSET,
     auto_block_pin_min_blocks: int = _UNSET,
     auto_block_pin_ram_evict_headroom_gb: float = _UNSET,
+    auto_block_pin_act_intercept_gb: float = _UNSET,
+    auto_block_pin_act_slope_gb_per_ktoken: float = _UNSET,
+    auto_block_pin_act_safety_factor: float = _UNSET,
+    auto_block_pin_act_fallback_gb: float = _UNSET,
 ) -> Any:
     """Wrap a diffusers pipeline with smart model management.
 
@@ -116,19 +120,29 @@ def managed(
         auto_low_cpu_mem_ram_headroom_gb: RAM headroom (GiB) required to
             flip ``group_offload``'s ``low_cpu_mem_usage=False`` when
             ``auto`` picks it. Default ``16.0``.
-        auto_block_pin_working_set_gb: VRAM (GiB) reserved per
-            ``block_pin`` component for streaming working set on
-            Linux/macOS. Default ``6.5``. Bump for long-video workloads
-            (10–14 GiB measured at 768×512×121f).
+        auto_block_pin_working_set_gb: Platform safety headroom (GiB)
+            added on top of the workload-aware activation estimate for
+            the ``block_pin`` working set, on Linux/macOS. Default
+            ``2.0``. (The bulk of the reserve now scales with the recorded
+            workload — see ``ModelManager.set_block_pin_workload``.)
         auto_block_pin_working_set_windows_gb: Same as above on Windows
-            (no ``expandable_segments``, ~2 GiB structural overhead).
-            Default ``8.5``.
+            (no ``expandable_segments``, larger allocator overhead).
+            Default ``3.0``.
         auto_block_pin_min_blocks: Minimum block count required before
             ``auto`` will pick ``block_pin`` over ``group_offload``.
             Default ``8``.
         auto_block_pin_ram_evict_headroom_gb: RAM safety margin (GiB)
             for the ``block_pin`` auto-evict RAM-absorb check. Default
             ``4.0``.
+        auto_block_pin_act_intercept_gb: Intercept (GiB) of the
+            workload-aware activation fit. Default ``0.30``.
+        auto_block_pin_act_slope_gb_per_ktoken: Slope (GiB per 1000
+            ``batch × seq_len`` tokens) of the activation fit. Default
+            ``0.118``.
+        auto_block_pin_act_safety_factor: Multiplier on the activation
+            estimate before adding the platform headroom. Default ``1.5``.
+        auto_block_pin_act_fallback_gb: Activation estimate (GiB) used
+            when no workload has been recorded. Default ``4.0``.
 
     Returns:
         The same pipeline object, augmented with a ``.mm`` attribute and
@@ -157,6 +171,10 @@ def managed(
         "auto_block_pin_working_set_windows_gb": auto_block_pin_working_set_windows_gb,
         "auto_block_pin_min_blocks": auto_block_pin_min_blocks,
         "auto_block_pin_ram_evict_headroom_gb": auto_block_pin_ram_evict_headroom_gb,
+        "auto_block_pin_act_intercept_gb": auto_block_pin_act_intercept_gb,
+        "auto_block_pin_act_slope_gb_per_ktoken": auto_block_pin_act_slope_gb_per_ktoken,
+        "auto_block_pin_act_safety_factor": auto_block_pin_act_safety_factor,
+        "auto_block_pin_act_fallback_gb": auto_block_pin_act_fallback_gb,
     }
     explicit = {k: v for k, v in config_kwargs.items() if v is not _UNSET}
 

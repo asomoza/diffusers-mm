@@ -94,7 +94,7 @@ class TestManagedGroupOffloadOptions:
 
 
 class TestManagedAutoTuningKwargs:
-    """The 8 ``auto_*`` knobs should reach the manager constructed inside managed()."""
+    """The ``auto_*`` knobs should reach the manager constructed inside managed()."""
 
     def test_all_auto_kwargs_forwarded(self):
         pipe = FakePipeline(transformer=DummyModel())
@@ -110,6 +110,10 @@ class TestManagedAutoTuningKwargs:
             auto_block_pin_working_set_windows_gb=14.0,
             auto_block_pin_min_blocks=12,
             auto_block_pin_ram_evict_headroom_gb=6.0,
+            auto_block_pin_act_intercept_gb=0.5,
+            auto_block_pin_act_slope_gb_per_ktoken=0.2,
+            auto_block_pin_act_safety_factor=2.0,
+            auto_block_pin_act_fallback_gb=5.0,
         )
         mm = pipe.mm
         assert mm.AUTO_NO_OFFLOAD_FACTOR == 2.5
@@ -120,6 +124,10 @@ class TestManagedAutoTuningKwargs:
         assert mm.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB == 14.0
         assert mm.AUTO_BLOCK_PIN_MIN_BLOCKS == 12
         assert mm.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB == 6.0
+        assert mm.AUTO_BLOCK_PIN_ACT_INTERCEPT_GB == 0.5
+        assert mm.AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN == 0.2
+        assert mm.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR == 2.0
+        assert mm.AUTO_BLOCK_PIN_ACT_FALLBACK_GB == 5.0
 
     def test_unset_kwargs_leave_class_defaults(self):
         pipe = FakePipeline(transformer=DummyModel())
@@ -130,7 +138,7 @@ class TestManagedAutoTuningKwargs:
         assert "AUTO_BLOCK_PIN_WORKING_SET_GB" not in mm.__dict__
         # And class defaults are reached as normal.
         assert mm.AUTO_NO_OFFLOAD_FACTOR == 1.5
-        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 6.5
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 2.0
 
     def test_auto_kwarg_with_existing_mm_warns_and_is_ignored(self, caplog):
         # Mixing mm= with any config kwarg (including the new auto_* ones)
@@ -142,7 +150,7 @@ class TestManagedAutoTuningKwargs:
         assert any("an existing ModelManager was supplied along with" in rec.message for rec in caplog.records)
         # Manager's class default still applies — the kwarg was dropped.
         assert "AUTO_BLOCK_PIN_WORKING_SET_GB" not in mm.__dict__
-        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 6.5
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 2.0
 
 
 class TestManagedSharedManager:

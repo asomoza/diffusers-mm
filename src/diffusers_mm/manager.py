@@ -17,6 +17,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from diffusers_mm import offload_defaults
 from diffusers_mm.block_pin import (
     BlockPinState,
     apply_block_pin,
@@ -82,7 +83,10 @@ class ModelManager:
     # go on top. 1.5× is a reasonable middle-ground for typical diffusion
     # pipelines (SDXL, Flux, Wan-class). Tweak via subclass / attribute set
     # if your workload has unusually large or small activation footprint.
-    AUTO_NO_OFFLOAD_FACTOR = 1.5  # full pipeline must fit in VRAM × this margin
+    AUTO_NO_OFFLOAD_FACTOR = 1.5  # DEPRECATED: superseded by the additive
+    # ``weights + working_set`` no_offload gate (see resolve_offload_strategy).
+    # Retained so existing ctor/attribute usage keeps working; no longer read
+    # by the default resolver path.
     AUTO_MODEL_OFFLOAD_FACTOR = 1.5  # largest single component must fit × this
     # If pipeline weights exceed RAM × this, log a loud warning that the
     # workload likely won't fit on host memory at all.
@@ -100,36 +104,38 @@ class ModelManager:
     # is mmap'd (originals may or may not be resident, and pages get
     # evicted as needed). Default 16 GB is comfortable for most setups.
     AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB = 16.0
-    # Block-pin auto-budget: when computing the optimal ``num_to_pin`` per
-    # component, reserve this much VRAM for the streaming overflow's
-    # working set (pinned host buffers in flight + activations + per-step
-    # peaks).
+    # Block-pin auto-budget: the VRAM reserved per component for the
+    # streaming overflow's working set (pinned host buffers in flight +
+    # denoise activations + per-step peaks). This is **workload-aware** —
+    # see :meth:`_resolve_working_set_gb`. The reserve is
+    #   ``activation_estimate(seq_len, batch) × SAFETY_FACTOR + headroom``
+    # where the activation estimate is a linear fit in the denoise
+    # sequence length (recorded via :meth:`set_block_pin_workload`), so it
+    # scales with video size / length instead of a flat constant. When no
+    # workload is recorded it falls back to ``ACT_FALLBACK_GB``.
     #
-    # Empirically calibrated for image-diffusion workloads. **For long
-    # video at meaningful resolution (e.g. LTX-2.3 at 768×512×121f) the
-    # actual working set is 10–14 GiB**, far above this constant — the
-    # auto-budget will over-pin on small GPUs and overflow. Bump this on
-    # the instance/subclass for those workloads, or override the per-
-    # component pin count via :meth:`set_block_pin_count`.
-    #
-    # Measured on LTX-2.3 distilled int4 (per-block 0.223 GiB,
-    # non-block 0.71 GiB, 48 blocks) at 768×512×121f, 8 steps:
-    #   - Linux RTX 5090 32 GiB:    WS ≈ 10.3 GiB (n=28) → 12.2 GiB (n=0)
-    #   - Windows RTX 4090L 16 GiB: WS ≈ 13.1 GiB (n=28) → 14.3 GiB (n=0)
-    # Working set scales with the number of streamed (non-pinned) blocks;
-    # the constant cannot capture that, so we pick a conservative value
-    # that's safe for image diffusion and document the video gap.
-    AUTO_BLOCK_PIN_WORKING_SET_GB = 6.5
-    # Windows pays a structural ~2 GiB penalty on top of the Linux value:
-    # ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`` is Linux-only
-    # (relies on the CUDA virtual memory management API not exposed on
-    # the Windows driver), so the Windows allocator runs in fixed-segment
-    # mode and reserves more under the same load. Measured on the same
-    # LTX-2.3 int4 sweep above, ``peak_reserved`` was 2.0–2.8 GiB higher
-    # on Windows 16 GiB than Linux 32 GiB at every pin count. Splitting
-    # the constant by OS keeps Linux users from paying for an allocator
-    # regime they don't have. Override the same way as the Linux value.
-    AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB = 8.5
+    # The two ``WORKING_SET`` constants below are now the **platform
+    # safety headroom added on top of** that activation estimate (allocator
+    # fragmentation, the group-offload stream double-buffer, modest
+    # attention overhead) — NOT the whole working set as in older releases.
+    # Windows is higher because ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``
+    # is Linux-only (relies on the CUDA virtual memory management API not
+    # exposed on the Windows driver), so the Windows allocator runs in
+    # fixed-segment mode and reserves more under the same load. Override
+    # either on the instance/subclass (or via ctor arg) for unusual
+    # allocator behaviour.
+    AUTO_BLOCK_PIN_WORKING_SET_GB = offload_defaults.BLOCK_PIN_WORKING_SET_HEADROOM_GB
+    AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB = offload_defaults.BLOCK_PIN_WORKING_SET_HEADROOM_WINDOWS_GB
+    # Workload-aware activation fit (GB), measured on LTX-2.3 distilled; the
+    # denoise working set is bf16 regardless of weight quantization so it
+    # generalises. ``intercept + slope × ktokens`` where
+    # ``ktokens = batch × seq_len / 1000``. The safety factor lifts the bare
+    # fit to a safe ceiling (cross-model variance + neighbor-onload
+    # transients); the fallback is used when the workload is unknown.
+    AUTO_BLOCK_PIN_ACT_INTERCEPT_GB = offload_defaults.BLOCK_PIN_ACT_INTERCEPT_GB
+    AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN = offload_defaults.BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN
+    AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR = offload_defaults.BLOCK_PIN_ACT_SAFETY_FACTOR
+    AUTO_BLOCK_PIN_ACT_FALLBACK_GB = offload_defaults.BLOCK_PIN_ACT_FALLBACK_GB
     # Don't bother with block_pin if the discoverable block list is
     # smaller than this — the overhead of per-block apply_group_offloading
     # outweighs the benefit when there are only a handful of blocks.
@@ -173,6 +179,10 @@ class ModelManager:
         auto_block_pin_working_set_windows_gb: float | None = None,
         auto_block_pin_min_blocks: int | None = None,
         auto_block_pin_ram_evict_headroom_gb: float | None = None,
+        auto_block_pin_act_intercept_gb: float | None = None,
+        auto_block_pin_act_slope_gb_per_ktoken: float | None = None,
+        auto_block_pin_act_safety_factor: float | None = None,
+        auto_block_pin_act_fallback_gb: float | None = None,
     ) -> None:
         """Construct a manager.
 
@@ -221,17 +231,18 @@ class ModelManager:
                 ``RAM ≥ pipeline_weights + this``. Default ``16.0`` GiB.
                 Lower the headroom on RAM-rich systems to bias toward
                 speed; raise it on tight systems to stay in low-RAM mode.
-            auto_block_pin_working_set_gb: VRAM reserved per
-                ``block_pin`` component for the streaming overflow's
-                working set (pinned host buffers in flight + activations
-                + per-step peaks). Default ``6.5`` GiB — calibrated for
-                image diffusion. Long-video workloads (e.g. LTX-2.3 at
-                768×512×121f) measure 10–14 GiB and should bump this.
-            auto_block_pin_working_set_windows_gb: Same as above, but
-                applied on Windows. Default ``8.5`` GiB — ~2 GiB higher
-                because the Windows allocator runs in fixed-segment mode
-                (no ``expandable_segments`` support) and reserves more
-                under the same load.
+            auto_block_pin_working_set_gb: Platform safety headroom (GiB)
+                added on top of the workload-aware activation estimate for
+                the ``block_pin`` working set. Default ``2.0`` GiB. (In
+                releases ≤ 0.2.x this was the *entire* working-set margin
+                at ``6.5``; it is now just the headroom — the bulk of the
+                reserve now scales with the recorded workload, see
+                :meth:`set_block_pin_workload`.)
+            auto_block_pin_working_set_windows_gb: Same as above, on
+                Windows. Default ``3.0`` GiB — higher because the Windows
+                allocator runs in fixed-segment mode (no
+                ``expandable_segments`` support) and reserves more under
+                the same load.
             auto_block_pin_min_blocks: Minimum block count required for
                 ``auto`` to pick ``block_pin`` over plain
                 ``group_offload``. Default ``8`` — below this, per-block
@@ -242,6 +253,18 @@ class ModelManager:
                 only when ``ram_available ≥ evicted_subset + this``.
                 Default ``4.0`` GiB. Raise on systems where neighbors
                 have unusually large host-side staging needs.
+            auto_block_pin_act_intercept_gb: Intercept (GiB) of the
+                workload-aware activation fit. Default ``0.30``.
+            auto_block_pin_act_slope_gb_per_ktoken: Slope (GiB per 1000
+                ``batch × seq_len`` tokens) of the activation fit.
+                Default ``0.118``. Raise for pipelines whose activations
+                grow faster with sequence length.
+            auto_block_pin_act_safety_factor: Multiplier on the activation
+                estimate before adding the platform headroom. Default
+                ``1.5``.
+            auto_block_pin_act_fallback_gb: Activation estimate used when
+                no workload has been recorded via
+                :meth:`set_block_pin_workload`. Default ``4.0`` GiB.
         """
         self._lock = threading.RLock()
         self._component_cache: dict[str, Any] = {}
@@ -282,6 +305,15 @@ class ModelManager:
         # to pin on GPU. Names absent from this dict get auto-computed from
         # the available VRAM at apply time.
         self._block_pin_counts: dict[str, int] = {}
+        # Expected denoise workload for the workload-aware block_pin working
+        # set. ``seq_len = latent_frames × latent_h × latent_w`` and ``batch``
+        # is 2 under CFG; ``activation_scale`` (>= 1.0) inflates the base
+        # estimate for LoRAs / conditioning (see ``block_pin_activation_scale``).
+        # Recorded via :meth:`set_block_pin_workload`; ``seq_len = 0`` means
+        # "unknown" and falls back to ``AUTO_BLOCK_PIN_ACT_FALLBACK_GB``.
+        self._block_pin_seq_len: int = 0
+        self._block_pin_batch: int = 1
+        self._block_pin_activation_scale: float = 1.0
         # Per-component pinned-subset state, populated when block_pin is
         # applied. Drives the auto-evict / repin pre-forward hooks so the
         # pinned weights don't squat on VRAM while a sibling component
@@ -352,6 +384,14 @@ class ModelManager:
             self.AUTO_BLOCK_PIN_MIN_BLOCKS = int(auto_block_pin_min_blocks)
         if auto_block_pin_ram_evict_headroom_gb is not None:
             self.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB = float(auto_block_pin_ram_evict_headroom_gb)
+        if auto_block_pin_act_intercept_gb is not None:
+            self.AUTO_BLOCK_PIN_ACT_INTERCEPT_GB = float(auto_block_pin_act_intercept_gb)
+        if auto_block_pin_act_slope_gb_per_ktoken is not None:
+            self.AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN = float(auto_block_pin_act_slope_gb_per_ktoken)
+        if auto_block_pin_act_safety_factor is not None:
+            self.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR = float(auto_block_pin_act_safety_factor)
+        if auto_block_pin_act_fallback_gb is not None:
+            self.AUTO_BLOCK_PIN_ACT_FALLBACK_GB = float(auto_block_pin_act_fallback_gb)
 
     # ------------------------------------------------------------------
     # Strategy properties
@@ -951,8 +991,8 @@ class ModelManager:
 
         Decision rule:
 
-        - If pipeline weights × ``AUTO_NO_OFFLOAD_FACTOR`` ≤ available VRAM →
-          ``no_offload`` (everything fits on GPU with activation headroom).
+        - If pipeline weights + the workload-aware working set ≤ available VRAM
+          → ``no_offload`` (everything fits on GPU with activation headroom).
         - Else if block_pin would pin the *entire* largest component on the GPU
           (``_block_pin_would_fully_pin_largest``) → ``block_pin``. Same VRAM
           peak as model_offload, but the transformer stays resident across runs
@@ -1016,7 +1056,13 @@ class ModelManager:
                 ram_avail_gb,
             )
 
-        if weights_gb * self.AUTO_NO_OFFLOAD_FACTOR <= vram_avail_gb:
+        # no_offload must leave room for the denoise activations too, not
+        # just the resident weights — a long/large video needs several GB of
+        # working set on top. The additive reserve (weights + working_set) is
+        # workload-aware via set_block_pin_workload, replacing the old flat
+        # ``weights × AUTO_NO_OFFLOAD_FACTOR`` multiplier (retained as a
+        # deprecated ctor arg / constant for backward compatibility only).
+        if weights_gb + self._resolve_working_set_gb() <= vram_avail_gb:
             chosen = "no_offload"
         elif self._block_pin_would_fully_pin_largest(device):
             # The largest component (typically the transformer) fits entirely as
@@ -1305,17 +1351,73 @@ class ModelManager:
             else:
                 self._evict_on_neighbor[component_name] = bool(value)
 
-    def _resolve_working_set_gb(self) -> float:
-        """Return the platform-appropriate working-set margin.
+    def set_block_pin_workload(self, seq_len: int, batch: int = 1, *, activation_scale: float = 1.0) -> None:
+        """Record the expected denoise workload for block_pin budgeting.
 
-        Windows uses the higher constant because ``expandable_segments``
-        is Linux-only and the Windows allocator reserves ~2 GiB more
-        under the same load. See the class-level constants for the full
-        rationale.
+        Makes the block_pin working set (and the ``no_offload`` activation
+        reserve) scale with the actual job instead of a flat constant. Call
+        it before ``managed()`` / ``apply_offload_strategy`` runs the
+        resolver — e.g. once the latent dimensions are known.
+
+        Args:
+            seq_len: Denoise sequence length, ``latent_frames × latent_h ×
+                latent_w`` (for images ``latent_frames`` is 1). ``0`` clears
+                the workload and falls back to ``AUTO_BLOCK_PIN_ACT_FALLBACK_GB``.
+            batch: Forward batch size — ``2`` when classifier-free guidance
+                doubles the batch, else ``1``.
+            activation_scale: ``>= 1.0`` multiplier inflating the base
+                activation estimate for LoRAs / conditioning that make the
+                forward allocate more than a plain text-to-X pass. See
+                :func:`diffusers_mm.offload_defaults.block_pin_activation_scale`.
+        """
+        with self._lock:
+            self._block_pin_seq_len = max(0, int(seq_len))
+            self._block_pin_batch = max(1, int(batch))
+            self._block_pin_activation_scale = max(1.0, float(activation_scale))
+
+    def _resolve_working_set_headroom_gb(self) -> float:
+        """Platform-appropriate safety headroom added on top of the activation estimate.
+
+        Windows uses the higher constant because ``expandable_segments`` is
+        Linux-only and the Windows allocator reserves more under the same load.
         """
         if sys.platform == "win32":
             return self.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB
         return self.AUTO_BLOCK_PIN_WORKING_SET_GB
+
+    def _activation_estimate_gb(self, seq_len: int, batch: int) -> float:
+        """Estimated transformer activation VRAM (GB) for a denoise forward.
+
+        Linear fit ``intercept + slope × ktokens`` (``ktokens = batch ×
+        seq_len / 1000``), scaled by the recorded ``activation_scale``.
+        Activations are bf16 regardless of weight quantization, so the fit
+        generalises across dtypes. Returns the fixed fallback when ``seq_len``
+        is unknown.
+        """
+        with self._lock:
+            scale = self._block_pin_activation_scale
+        if seq_len <= 0:
+            return self.AUTO_BLOCK_PIN_ACT_FALLBACK_GB * scale
+        ktokens = (batch * seq_len) / 1000.0
+        base = self.AUTO_BLOCK_PIN_ACT_INTERCEPT_GB + self.AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN * ktokens
+        return base * scale
+
+    def _resolve_working_set_gb(self) -> float:
+        """Working-set VRAM (GB) to reserve per block_pin component.
+
+        ``activation_estimate × SAFETY_FACTOR + platform_headroom``, using
+        the workload recorded via :meth:`set_block_pin_workload`. Scales with
+        video size / length instead of a flat constant; falls back to a fixed
+        activation estimate when the workload is unknown. Also serves as the
+        eviction threshold (a neighbor triggers pinned-block eviction before
+        its onload would OOM) and the ``no_offload`` activation reserve, so
+        all three stay self-consistent.
+        """
+        with self._lock:
+            seq_len = self._block_pin_seq_len
+            batch = self._block_pin_batch
+        act = self._activation_estimate_gb(seq_len, batch) * self.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR
+        return act + self._resolve_working_set_headroom_gb()
 
     def _compute_block_pin_count(
         self,
@@ -2341,6 +2443,9 @@ class ModelManager:
             self._block_pin_auto_evict = True
             self._block_pin_counts.clear()
             self._evict_on_neighbor.clear()
+            self._block_pin_seq_len = 0
+            self._block_pin_batch = 1
+            self._block_pin_activation_scale = 1.0
         gc.collect()
         if torch.cuda.is_available():
             try:

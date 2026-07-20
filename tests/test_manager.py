@@ -19,6 +19,7 @@ from diffusers_mm.block_pin import (
     repin_pinned_subset,
 )
 from diffusers_mm.manager import ModelManager, get_device, get_dtype
+from diffusers_mm.offload_defaults import block_pin_activation_scale
 
 
 class DummyModel(nn.Module):
@@ -75,10 +76,14 @@ class TestAutoTuningCtorArgs:
         assert mm.AUTO_MODEL_OFFLOAD_FACTOR == 1.5
         assert mm.AUTO_RAM_HEADROOM == 0.85
         assert mm.AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB == 16.0
-        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 6.5
-        assert mm.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB == 8.5
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_GB == 2.0
+        assert mm.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB == 3.0
         assert mm.AUTO_BLOCK_PIN_MIN_BLOCKS == 8
         assert mm.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB == 4.0
+        assert mm.AUTO_BLOCK_PIN_ACT_INTERCEPT_GB == 0.30
+        assert mm.AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN == 0.118
+        assert mm.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR == 1.5
+        assert mm.AUTO_BLOCK_PIN_ACT_FALLBACK_GB == 4.0
         # No instance attribute shadow exists when defaults were used.
         assert "AUTO_NO_OFFLOAD_FACTOR" not in mm.__dict__
         assert "AUTO_BLOCK_PIN_WORKING_SET_GB" not in mm.__dict__
@@ -126,24 +131,26 @@ class TestAutoTuningCtorArgs:
         assert mm2.AUTO_BLOCK_PIN_WORKING_SET_GB == 15.0
 
     def test_ctor_arg_affects_resolver_decision(self):
-        # End-to-end check: raising AUTO_NO_OFFLOAD_FACTOR should push the
-        # auto-resolver past the no_offload threshold even when the
-        # default factor would have allowed it.
-        mm = ModelManager(strategy="auto", auto_no_offload_factor=4.0)
-        # No components registered → resolver falls back to the simple
-        # VRAM-only tier table, which doesn't use the factor. Register a
-        # tiny component so the size-aware path runs instead.
-        mm.register_component("tiny", DummyModel())
+        # End-to-end check: the no_offload gate is additive
+        # (weights + working_set <= VRAM), and raising the block_pin
+        # working-set headroom inflates that reserve enough to push the
+        # resolver past no_offload where the default headroom would fit.
+        def make(**kwargs):
+            mm = ModelManager(strategy="auto", **kwargs)
+            # No components → simple VRAM-tier table; register a tiny one so
+            # the size-aware path runs instead.
+            mm.register_component("tiny", DummyModel())
+            mm._detect_available_vram_gb = lambda device: (14.0, 14.0)
+            mm._detect_available_ram_gb = lambda: (64.0, 64.0)
+            mm._estimate_components_size_gb = lambda: (3.0, 3.0)
+            return mm
 
-        # Patch the env so the size-aware path is reached with plenty
-        # of VRAM/RAM, but the factored threshold is the binding rule.
-        mm._detect_available_vram_gb = lambda device: (10.0, 10.0)
-        mm._detect_available_ram_gb = lambda: (64.0, 64.0)
-        mm._estimate_components_size_gb = lambda: (3.0, 3.0)
-        # weights=3.0 GiB, factor=4.0 → required 12.0 GiB; VRAM=10.0 → fail tier 1.
-        # Without our override (factor=1.5 → required 4.5 GiB) tier 1 would pass.
-        resolved = mm.resolve_offload_strategy("cuda")
-        assert resolved != "no_offload"
+        # Default headroom (2.0) → working set 4.0×1.5 + 2.0 = 8.0;
+        # 3.0 + 8.0 = 11.0 <= 14.0 → no_offload.
+        assert make().resolve_offload_strategy("cuda") == "no_offload"
+        # Raised headroom (12.0) → working set 4.0×1.5 + 12.0 = 18.0;
+        # 3.0 + 18.0 = 21.0 > 14.0 → no longer no_offload.
+        assert make(auto_block_pin_working_set_gb=12.0).resolve_offload_strategy("cuda") != "no_offload"
 
 
 class TestGroupOffloadKwargs:
@@ -1521,10 +1528,11 @@ class TestBlockPinCount:
             mm.set_block_pin_count("transformer", -1)
 
     def test_auto_count_uses_vram_budget(self, monkeypatch):
-        # 12 GB VRAM, 0.5 GB non-block, 6.5 GB Linux working set, 1 GB
-        # streamed in flight = 4.0 GB budget. Per-block size = 1 GB → 4
-        # blocks fit. Pin sys.platform to "linux" so the test is stable
-        # regardless of host OS.
+        # 12 GB VRAM, 0.5 GB non-block, 1 GB streamed in flight. With no
+        # recorded workload the working set is the fallback: act 4.0 ×
+        # safety 1.5 + Linux headroom 2.0 = 8.0 GiB. Budget = 12 - 0.5 -
+        # 8.0 - 1 = 2.5 GB → 2 blocks fit. Pin sys.platform to "linux" so
+        # the test is stable regardless of host OS.
         monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
         _patch_vram(monkeypatch, 12.0)
         mm = ModelManager()
@@ -1535,14 +1543,14 @@ class TestBlockPinCount:
         m = nn.Module()
         m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(20)])
         n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
-        assert n == 4
+        assert n == 2
 
     def test_auto_count_uses_windows_working_set(self, monkeypatch):
         # Same 12 GB VRAM / 0.5 GB non-block / 1 GB per-block as the Linux
-        # test, but on Windows the working set is 8.5 GiB → budget = 12 -
-        # 0.5 - 8.5 - 1 = 2.0 GB → 2 blocks fit (2 fewer than on Linux).
-        # This is the whole point of the OS split: don't make Linux pay
-        # for Windows' allocator overhead.
+        # test, but on Windows the headroom is 3.0 GiB → working set =
+        # 4.0 × 1.5 + 3.0 = 9.0 GiB → budget = 12 - 0.5 - 9.0 - 1 = 1.5 GB
+        # → 1 block fits (fewer than Linux). The OS split: don't make Linux
+        # pay for Windows' allocator overhead.
         monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
         _patch_vram(monkeypatch, 12.0)
         mm = ModelManager()
@@ -1551,10 +1559,31 @@ class TestBlockPinCount:
         m = nn.Module()
         m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(20)])
         n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
-        assert n == 2
+        assert n == 1
+
+    def test_auto_count_shrinks_as_workload_grows(self, monkeypatch):
+        # The workload-aware working set: a larger recorded denoise seq_len
+        # raises the activation reserve, leaving budget for fewer pinned
+        # blocks. 40 GB VRAM, no non-block, 1 GB per-block. With no workload
+        # the working set is the 8.0 GiB fallback (budget 31 → 31 blocks);
+        # with a large workload the reserve grows and the count drops.
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        _patch_vram(monkeypatch, 40.0)
+        monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(1.0 * 1024**3))
+        monkeypatch.setattr("diffusers_mm.manager.non_block_size_bytes", lambda c, a: 0)
+        m = nn.Module()
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(64)])
+
+        mm = ModelManager()
+        baseline = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
+        # seq_len = 100k tokens, batch 2 → 200 ktokens → act ≈ 0.30 + 0.118×200
+        # = 23.9, × 1.5 + 2.0 ≈ 37.8 GiB working set → far fewer blocks.
+        mm.set_block_pin_workload(100_000, batch=2)
+        loaded = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
+        assert loaded < baseline
 
     def test_auto_count_returns_zero_when_no_budget(self, monkeypatch, caplog):
-        # 6 GB VRAM, 6 GB non-block → budget = 6 - 6 - 6.5 - 1 = -7.5 → 0 pinned.
+        # 6 GB VRAM, 6 GB non-block → budget = 6 - 6 - 8.0 - 1 = -9.0 → 0 pinned.
         monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
         _patch_vram(monkeypatch, 6.0)
         mm = ModelManager()
@@ -1577,6 +1606,82 @@ class TestBlockPinCount:
         m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(4)])
         n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
         assert n == 4
+
+
+class TestWorkloadAwareWorkingSet:
+    """``set_block_pin_workload`` drives the workload-aware activation reserve."""
+
+    def test_fallback_when_no_workload(self, monkeypatch):
+        # No workload recorded → activation falls back to ACT_FALLBACK_GB.
+        # working set = 4.0 × 1.5 + 2.0 headroom = 8.0 on Linux.
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        mm = ModelManager()
+        assert mm._resolve_working_set_gb() == pytest.approx(8.0)
+
+    def test_windows_headroom_higher(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        mm = ModelManager()
+        # 4.0 × 1.5 + 3.0 = 9.0
+        assert mm._resolve_working_set_gb() == pytest.approx(9.0)
+
+    def test_linear_fit_scales_with_seq_len(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        mm = ModelManager()
+        # seq_len = 10_000, batch 2 → 20 ktokens.
+        # act = 0.30 + 0.118 × 20 = 2.66; × 1.5 + 2.0 = 5.99.
+        mm.set_block_pin_workload(10_000, batch=2)
+        assert mm._resolve_working_set_gb() == pytest.approx((0.30 + 0.118 * 20.0) * 1.5 + 2.0)
+
+    def test_activation_scale_inflates_estimate(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        mm = ModelManager()
+        mm.set_block_pin_workload(10_000, batch=2)
+        base = mm._resolve_working_set_gb()
+        mm.set_block_pin_workload(10_000, batch=2, activation_scale=2.0)
+        scaled = mm._resolve_working_set_gb()
+        # The activation term doubles; the flat headroom does not.
+        assert scaled > base
+
+    def test_activation_scale_floored_at_one(self):
+        mm = ModelManager()
+        mm.set_block_pin_workload(1000, activation_scale=0.5)
+        assert mm._block_pin_activation_scale == 1.0
+
+    def test_seq_len_zero_clears_workload(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        mm = ModelManager()
+        mm.set_block_pin_workload(10_000, batch=2)
+        mm.set_block_pin_workload(0)
+        assert mm._resolve_working_set_gb() == pytest.approx(8.0)  # back to fallback
+
+    def test_clear_resets_workload(self):
+        mm = ModelManager()
+        mm.set_block_pin_workload(10_000, batch=2, activation_scale=1.5)
+        mm.clear()
+        assert mm._block_pin_seq_len == 0
+        assert mm._block_pin_batch == 1
+        assert mm._block_pin_activation_scale == 1.0
+
+
+class TestBlockPinActivationScale:
+    """The conditioning/LoRA multiplier helper."""
+
+    def test_plain_pass_is_one(self):
+        assert block_pin_activation_scale() == 1.0
+
+    def test_lora_count_adds_per_adapter(self):
+        assert block_pin_activation_scale(lora_count=2) == pytest.approx(1.0 + 0.5 * 2)
+
+    def test_image_conditioning(self):
+        assert block_pin_activation_scale(image_cond=True) == pytest.approx(1.65)
+
+    def test_video_replace_vs_keyframe(self):
+        replace = block_pin_activation_scale(video_cond=True, video_mode="replace")
+        keyframe = block_pin_activation_scale(video_cond=True, video_mode="keyframe")
+        assert keyframe > replace
+
+    def test_negative_lora_count_ignored(self):
+        assert block_pin_activation_scale(lora_count=-3) == 1.0
 
 
 class TestAutoResolutionPicksBlockPin:
