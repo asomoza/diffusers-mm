@@ -993,6 +993,51 @@ class _BlockyDenoiser(nn.Module):
         self.transformer_blocks = nn.ModuleList(nn.Linear(2, 2) for _ in range(n_blocks))
 
 
+class _NestedBlockModule(nn.Module):
+    """Component whose repeated blocks are nested one level down.
+
+    Mirrors a text encoder (e.g. Qwen3-VL) whose blocks live at
+    ``.language_model.layers`` — invisible to the top-level-only
+    ``find_largest_block_list``. Sized larger than ``_BlockyDenoiser`` (wider
+    linears) so it's the largest component by param bytes, reproducing the
+    Ideogram4 shape where the heaviest component isn't the one we'd pin.
+    """
+
+    class _Inner(nn.Module):
+        def __init__(self, n_blocks: int) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList(nn.Linear(64, 64) for _ in range(n_blocks))
+
+    def __init__(self, n_blocks: int = 16) -> None:
+        super().__init__()
+        self.language_model = self._Inner(n_blocks)
+
+
+class TestLargestBlockListInfo:
+    """_largest_block_list_info picks the largest *block-bearing* component."""
+
+    def test_prefers_block_bearing_over_larger_nonpinnable(self):
+        # text_encoder is larger by param bytes but its blocks are nested
+        # (no top-level list); the smaller transformer has a top-level list.
+        mm = ModelManager()
+        mm.register_component("text_encoder", _NestedBlockModule())
+        mm.register_component("transformer", _BlockyDenoiser())
+        # Sanity: the nested one really is the larger component.
+        te = sum(p.numel() * p.element_size() for p in mm.get_component("text_encoder").parameters())
+        tr = sum(p.numel() * p.element_size() for p in mm.get_component("transformer").parameters())
+        assert te > tr
+        info = mm._largest_block_list_info()
+        assert info is not None
+        assert info[0] is mm.get_component("transformer")
+        assert mm._largest_component_has_block_list() is True
+
+    def test_none_when_no_component_has_toplevel_blocklist(self):
+        mm = ModelManager()
+        mm.register_component("text_encoder", _NestedBlockModule())
+        assert mm._largest_block_list_info() is None
+        assert mm._largest_component_has_block_list() is False
+
+
 class TestCoResidentDenoiserGuard:
     """auto must not pick model_offload when ≥2 denoisers are co-resident.
 
@@ -1037,6 +1082,20 @@ class TestCoResidentDenoiserGuard:
         mm.register_component("transformer", _BlockyDenoiser())
         assert mm._coresident_denoiser_count() == 1
         assert mm.resolve_offload_strategy("cuda") == "model_offload"
+
+    def test_larger_nonpinnable_textencoder_still_falls_through_to_block_pin(self, monkeypatch):
+        # The exact Ideogram4 shape: two co-resident transformers with top-level
+        # block lists, plus a text encoder that's LARGER by param bytes but
+        # whose blocks are nested (no top-level list). The guard rules out
+        # model_offload; the fall-through must find the transformers' block
+        # lists and pick block_pin — not bail to group_offload because the
+        # single largest component happens to lack a top-level list.
+        mm = self._mm(monkeypatch)
+        mm.register_component("text_encoder", _NestedBlockModule())
+        mm.register_component("transformer", _BlockyDenoiser())
+        mm.register_component("unconditional_transformer", _BlockyDenoiser())
+        assert mm._coresident_denoiser_count() == 2
+        assert mm.resolve_offload_strategy("cuda") == "block_pin"
 
 
 class TestRamDetection:

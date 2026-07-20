@@ -1535,43 +1535,55 @@ class ModelManager:
             )
 
     def _largest_block_list_info(self) -> tuple[nn.Module, str, Any] | None:
-        """Return ``(largest_component, block_attr, blocks)`` or ``None``.
+        """Return ``(component, block_attr, blocks)`` for the largest *block-bearing*
+        component, or ``None`` if no component has a usable block list.
 
-        Finds the largest registered component (by parameter bytes, deduped by
-        identity) and its largest repeated-block list. Shared by the block-list
-        check and the "would fully pin" check so they agree on which component
-        and block list they're reasoning about.
+        block_pin operates **per component** — it pins the repeated blocks of
+        each block-bearing component and group-offloads the rest — so the
+        decision that matters is "which is the heaviest component we could
+        actually pin", NOT "does the single largest component overall happen to
+        have a block list". Those differ whenever the largest component has no
+        top-level block list: e.g. a dual-DiT pipeline where the text encoder
+        (its blocks nested under ``.language_model.layers``, invisible to the
+        top-level-only :func:`find_largest_block_list`) is marginally larger
+        than each transformer. Selecting the largest component *among those with
+        a block list* finds the transformer's ``layers`` there instead of
+        bailing to ``group_offload``.
+
+        Shared by the block-list check and the "would fully pin" check so they
+        reason about the same component.
         """
         with self._lock:
             components = list(self._managed_components.values())
-        if not components:
-            return None
 
         seen_ids: set[int] = set()
-        largest: nn.Module | None = None
-        largest_size = 0
+        best: tuple[nn.Module, str, Any] | None = None
+        best_size = -1
         for mod in components:
             if id(mod) in seen_ids:
                 continue
             seen_ids.add(id(mod))
+            result = find_largest_block_list(mod)
+            if result is None:
+                continue
             try:
                 size = sum(p.numel() * p.element_size() for p in mod.parameters())
             except Exception:
                 continue
-            if size > largest_size:
-                largest_size = size
-                largest = mod
-        if largest is None:
-            return None
-
-        result = find_largest_block_list(largest)
-        if result is None:
-            return None
-        block_attr, blocks = result
-        return largest, block_attr, blocks
+            if size > best_size:
+                best_size = size
+                block_attr, blocks = result
+                best = (mod, block_attr, blocks)
+        return best
 
     def _largest_component_has_block_list(self) -> bool:
-        """True if the largest registered component has a usable block list.
+        """True if any registered component has a usable block list.
+
+        Reports on the largest *block-bearing* component (see
+        :meth:`_largest_block_list_info`), not the largest component overall —
+        so a pipeline whose heaviest component lacks a top-level block list
+        (e.g. a text encoder) still picks ``block_pin`` when a denoiser is
+        pinnable.
 
         "Usable" = at least :attr:`AUTO_BLOCK_PIN_MIN_BLOCKS` entries.
         Below that threshold, per-block ``apply_group_offloading``
