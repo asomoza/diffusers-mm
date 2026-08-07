@@ -31,6 +31,7 @@ del _require_companions
 from diffusers_mm.hooks import remove_offload_hooks  # noqa: E402
 from diffusers_mm.managed import managed  # noqa: E402
 from diffusers_mm.manager import ModelManager  # noqa: E402
+from diffusers_mm.model_profiles import ModelProfile, register_model_profile  # noqa: E402
 from diffusers_mm.offload_defaults import block_pin_activation_scale  # noqa: E402
 
 
@@ -45,8 +46,10 @@ except Exception:  # noqa: BLE001
 
 __all__ = [
     "ModelManager",
+    "ModelProfile",
     "__version__",
     "block_pin_activation_scale",
     "managed",
+    "register_model_profile",
     "remove_offload_hooks",
 ]

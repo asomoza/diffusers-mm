@@ -19,12 +19,35 @@ attribute on the manager (subclass, ctor arg, or instance assignment).
 # sweep: the denoise-loop peak minus the resident transformer weights is
 # cleanly linear in ``seq_len`` with a small slope and near-zero intercept.
 #   seq_len = (W / spatial) * (H / spatial) * ((frames - 1) / temporal + 1)
+#
+# These are the fallback for an architecture with no measured
+# ``ModelProfile.act_slope_gb_per_ktoken``. The slope was raised from 0.118 to
+# 0.16 in 2026-08 after direct measurement (see
+# ``demo_scripts/measure_activation_slope.py``) found *every* model tested sat
+# above the old value — including LTX-2.3, the model it was originally derived
+# from, which measures 0.136. 0.16 covers the measured cluster (LTX-2.3 0.136,
+# Krea 2 0.134, MiniMax-H3 0.158) with a little margin. It deliberately does
+# *not* try to cover outliers like Ideogram4 (0.60): stretching the default that
+# far would over-reserve for every ordinary model, so outliers get a profile.
+# The intercept stays at 0.30 despite measuring near zero on most models — it is
+# a cheap fixed cushion that matters only for small workloads, where being
+# generous is free.
 BLOCK_PIN_ACT_INTERCEPT_GB = 0.30
-BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN = 0.118
+BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN = 0.16
 # Multiplier on the activation estimate before adding platform headroom
 # (measured denoise peak -> safe ceiling, covering cross-model variance and
 # neighbor-onload transients).
 BLOCK_PIN_ACT_SAFETY_FACTOR = 1.5
+# Safety factor used when the slope came from a **measured**
+# ``ModelProfile.act_slope_gb_per_ktoken`` rather than the generic default.
+# Most of the 1.5x above is cushion for not knowing the architecture's real
+# slope; once it *is* known, keeping 1.5x double-counts. On MiniMax-H3 at
+# 104k tokens, 1.5x on the measured slope reserves 27.1 GiB of a 27.7 GiB card
+# and pins **zero** blocks — strictly worse than the under-budget it replaced.
+# 1.2x reproduces roughly the pin count that measurably worked, and still
+# covers the ~7% the probe misses (latents and text embeds held across the
+# step, stream staging, allocator slack).
+BLOCK_PIN_ACT_SAFETY_FACTOR_MEASURED = 1.2
 # Activation estimate used when the denoise seq_len is unknown at pin time
 # (i.e. the caller never called ``set_block_pin_workload``).
 BLOCK_PIN_ACT_FALLBACK_GB = 4.0

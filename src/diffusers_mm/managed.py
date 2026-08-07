@@ -33,6 +33,7 @@ def managed(
     denoiser_concurrency: str = _UNSET,
     block_pin_spill_aware: bool = _UNSET,
     block_pin_spill_margin_gb: float = _UNSET,
+    block_pin_workload_probe: bool = _UNSET,
     auto_no_offload_factor: float = _UNSET,
     auto_model_offload_factor: float = _UNSET,
     auto_ram_headroom: float = _UNSET,
@@ -95,12 +96,20 @@ def managed(
             during VAE decode at the cost of two extra CPU↔GPU transfers
             per inference (typically 1–2 s on PCIe 4). Default True.
         denoiser_concurrency: How to budget pipelines with multiple denoisers
-            (DiTs). ``"co_resident"`` (default) sums their sizes — correct when
-            both run every step (e.g. Ideogram4 conditional + unconditional
-            under True-CFG). ``"sequential"`` takes the largest single one —
-            correct when only one is active at a time (e.g. Wan2.2 high/low-noise
+            (DiTs). ``"co_resident"`` sums their sizes — correct when both run
+            every step (e.g. Ideogram4 conditional + unconditional under
+            True-CFG). ``"sequential"`` takes the largest single one — correct
+            when only one is active at a time (e.g. Wan2.2 high/low-noise
             experts split by timestep). Wrong-way ``sequential`` on a
             co-resident pipeline under-budgets and can spill to RAM.
+
+            Usually you don't need this: when left unset, recognised pipeline
+            architectures get the right value from their
+            :class:`~diffusers_mm.model_profiles.ModelProfile`, falling back to
+            ``"co_resident"`` for unknown ones. Pass it explicitly to override
+            the profile — an explicit value always wins. Teach the resolver about
+            a new architecture with
+            :func:`~diffusers_mm.model_profiles.register_model_profile`.
         block_pin_spill_aware: When ``block_pin`` is active, check after each
             managed generation whether the caching allocator reserved more than
             the card's VRAM (oversubscription / Windows sysmem fallback) and, if
@@ -109,6 +118,14 @@ def managed(
         block_pin_spill_margin_gb: Headroom (GiB) kept below total VRAM when
             deciding whether the last run spilled and how much to evict.
             Default ``0.5``.
+        block_pin_workload_probe: When ``block_pin`` is active, read the true
+            denoise sequence length off the denoiser's own input on its first
+            forward — before any activation is allocated — and unpin blocks if
+            the pin count doesn't leave enough room for it. This is what makes
+            ``strategy="auto"`` safe on long/large video without the caller
+            having to call :meth:`ModelManager.set_block_pin_workload`; the
+            apply-time budget otherwise falls back to an image-scale activation
+            estimate and over-pins. Only ever lowers the pin count. Default True.
         auto_no_offload_factor: Activation margin for the ``no_offload``
             auto tier (``pipeline_weights × this`` must fit in VRAM).
             Default ``1.5``.
@@ -163,6 +180,7 @@ def managed(
         "denoiser_concurrency": denoiser_concurrency,
         "block_pin_spill_aware": block_pin_spill_aware,
         "block_pin_spill_margin_gb": block_pin_spill_margin_gb,
+        "block_pin_workload_probe": block_pin_workload_probe,
         "auto_no_offload_factor": auto_no_offload_factor,
         "auto_model_offload_factor": auto_model_offload_factor,
         "auto_ram_headroom": auto_ram_headroom,

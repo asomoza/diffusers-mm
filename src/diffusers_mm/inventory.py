@@ -20,6 +20,7 @@ also expose repeated-block lists and would otherwise be misread as denoisers.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch.nn as nn
@@ -75,8 +76,17 @@ def classify_role(name: str, module: nn.Module, n_blocks: int, min_blocks: int) 
     return "other"
 
 
-def build_inventory(components: dict[str, nn.Module], min_blocks: int) -> list[ComponentInfo]:
-    """Classify every nn.Module in *components* (deduped by identity)."""
+def build_inventory(
+    components: dict[str, nn.Module],
+    min_blocks: int,
+    role_overrides: Mapping[str, str] | None = None,
+) -> list[ComponentInfo]:
+    """Classify every nn.Module in *components* (deduped by identity).
+
+    *role_overrides* comes from the pipeline's :class:`ModelProfile` and wins over
+    the name/structure heuristics — it exists for components whose role the
+    generic rules get wrong (see :mod:`diffusers_mm.model_profiles`).
+    """
     inventory: list[ComponentInfo] = []
     seen_ids: set[int] = set()
     for name, module in components.items():
@@ -86,7 +96,10 @@ def build_inventory(components: dict[str, nn.Module], min_blocks: int) -> list[C
         result = find_largest_block_list(module)
         block_attr, blocks = (result[0], result[1]) if result is not None else (None, None)
         n_blocks = len(blocks) if blocks is not None else 0
-        role = classify_role(name, module, n_blocks, min_blocks)
+        if role_overrides and name in role_overrides:
+            role = role_overrides[name]
+        else:
+            role = classify_role(name, module, n_blocks, min_blocks)
         inventory.append(
             ComponentInfo(
                 name=name,

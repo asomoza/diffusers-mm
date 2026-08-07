@@ -28,12 +28,13 @@ from diffusers_mm.block_pin import (
     repin_pinned_subset,
     unpin_blocks,
 )
-from diffusers_mm.hooks import remove_offload_hooks
+from diffusers_mm.hooks import find_legacy_weight_norm, remove_offload_hooks
 from diffusers_mm.inventory import ComponentInfo, build_inventory
+from diffusers_mm.model_profiles import DENOISER_CONCURRENCY_MODES, ModelProfile, get_model_profile
 from diffusers_mm.modular_compat import ensure_modular_compat
 
 
-DENOISER_CONCURRENCY_MODES = ("co_resident", "sequential")
+__all__ = ["DENOISER_CONCURRENCY_MODES", "ModelManager", "get_device", "get_dtype"]
 
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,7 @@ class ModelManager:
     AUTO_BLOCK_PIN_ACT_INTERCEPT_GB = offload_defaults.BLOCK_PIN_ACT_INTERCEPT_GB
     AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN = offload_defaults.BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN
     AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR = offload_defaults.BLOCK_PIN_ACT_SAFETY_FACTOR
+    AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR_MEASURED = offload_defaults.BLOCK_PIN_ACT_SAFETY_FACTOR_MEASURED
     AUTO_BLOCK_PIN_ACT_FALLBACK_GB = offload_defaults.BLOCK_PIN_ACT_FALLBACK_GB
     # Don't bother with block_pin if the discoverable block list is
     # smaller than this — the overhead of per-block apply_group_offloading
@@ -167,9 +169,10 @@ class ModelManager:
         group_offload_use_stream: bool = True,
         group_offload_low_cpu_mem: bool = True,
         block_pin_auto_evict: bool = True,
-        denoiser_concurrency: str = "co_resident",
+        denoiser_concurrency: str | None = None,
         block_pin_spill_aware: bool = True,
         block_pin_spill_margin_gb: float = 0.5,
+        block_pin_workload_probe: bool = True,
         *,
         auto_no_offload_factor: float | None = None,
         auto_model_offload_factor: float | None = None,
@@ -333,6 +336,9 @@ class ModelManager:
         self._block_pin_wrapped_methods: list[tuple[Any, str, Any]] = []
         # Forward-hook handles for the step-1 spill calibration (Windows).
         self._spill_calib_handles: list[Any] = []
+        # Pre-forward-hook handles for the one-shot workload probe, which reads
+        # the true sequence length off the denoiser's own input.
+        self._workload_probe_handles: list[Any] = []
         # Per-neighbor explicit override for the auto-evict decision.
         # ``True`` forces eviction on every call (paranoid mode); ``False``
         # disables it entirely for that component (e.g. text encoders that
@@ -350,11 +356,16 @@ class ModelManager:
         # How to budget multiple denoisers (DiTs): "co_resident" sums them (both
         # used every step, e.g. Ideogram4 True-CFG); "sequential" takes the max
         # (one active at a time, e.g. Wan2.2 high/low-noise experts).
-        if denoiser_concurrency not in DENOISER_CONCURRENCY_MODES:
+        # ``None`` means "use the registered pipeline's ModelProfile if it has one,
+        # else the co_resident default" — an explicit value always wins over the
+        # profile (see the ``denoiser_concurrency`` property).
+        if denoiser_concurrency is not None and denoiser_concurrency not in DENOISER_CONCURRENCY_MODES:
             raise ValueError(
                 f"denoiser_concurrency must be one of {DENOISER_CONCURRENCY_MODES}, got {denoiser_concurrency!r}"
             )
-        self.denoiser_concurrency: str = denoiser_concurrency
+        self._denoiser_concurrency: str | None = denoiser_concurrency
+        # ModelProfile of the registered pipeline architecture, if recognised.
+        self._model_profile: ModelProfile | None = None
 
         # Spill-aware block_pin: after a managed generation, if the caching
         # allocator reserved more than the card's VRAM (Windows sysmem fallback
@@ -362,6 +373,7 @@ class ModelManager:
         # the pin count to just under the ceiling for the actual workload.
         self._block_pin_spill_aware: bool = bool(block_pin_spill_aware)
         self._block_pin_spill_margin_gb: float = float(block_pin_spill_margin_gb)
+        self._block_pin_workload_probe: bool = bool(block_pin_workload_probe)
         self._block_pin_spill_recalibrations: int = 0
 
         # Per-instance overrides for the auto-resolver constants. We
@@ -384,6 +396,11 @@ class ModelManager:
             self.AUTO_BLOCK_PIN_MIN_BLOCKS = int(auto_block_pin_min_blocks)
         if auto_block_pin_ram_evict_headroom_gb is not None:
             self.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB = float(auto_block_pin_ram_evict_headroom_gb)
+        # Tracked so a ModelProfile's measured slope/intercept can slot in
+        # *between* an explicit caller value and the class default.
+        self._explicit_act_slope = auto_block_pin_act_slope_gb_per_ktoken is not None
+        self._explicit_act_intercept = auto_block_pin_act_intercept_gb is not None
+        self._explicit_act_safety_factor = auto_block_pin_act_safety_factor is not None
         if auto_block_pin_act_intercept_gb is not None:
             self.AUTO_BLOCK_PIN_ACT_INTERCEPT_GB = float(auto_block_pin_act_intercept_gb)
         if auto_block_pin_act_slope_gb_per_ktoken is not None:
@@ -596,6 +613,9 @@ class ModelManager:
             # Modular pipelines' _execution_device doesn't detect group-offload
             # onload devices; patch it so group_offload/block_pin work on them.
             ensure_modular_compat(source)
+            # Pick up per-architecture budgeting facts (denoiser concurrency,
+            # role hints) that can't be inferred from the module tree.
+            self._adopt_model_profile(source)
         else:
             raise TypeError(
                 f"register_components expected a pipeline (with .components) or a dict, got {type(source).__name__}"
@@ -945,16 +965,76 @@ class ModelManager:
                 max_bytes = size
         return total_bytes / (1024**3), max_bytes / (1024**3)
 
+    @property
+    def denoiser_concurrency(self) -> str:
+        """How to budget multiple denoisers: ``"co_resident"`` or ``"sequential"``.
+
+        Resolution order, most specific first:
+
+        1. An explicit value passed to the constructor / ``managed()`` — the
+           caller knows their pipeline better than any table.
+        2. The :class:`~diffusers_mm.model_profiles.ModelProfile` of the
+           registered pipeline architecture, if it is a recognised one.
+        3. ``"co_resident"`` — the safe default. Wrong-way ``co_resident`` on a
+           sequential pipeline merely over-reserves; wrong-way ``sequential`` on
+           a co-resident one under-budgets and spills.
+        """
+        if self._denoiser_concurrency is not None:
+            return self._denoiser_concurrency
+        if self._model_profile is not None and self._model_profile.denoiser_concurrency is not None:
+            return self._model_profile.denoiser_concurrency
+        return "co_resident"
+
+    @denoiser_concurrency.setter
+    def denoiser_concurrency(self, value: str | None) -> None:
+        if value is not None and value not in DENOISER_CONCURRENCY_MODES:
+            raise ValueError(f"denoiser_concurrency must be one of {DENOISER_CONCURRENCY_MODES}, got {value!r}")
+        self._denoiser_concurrency = value
+
+    def _adopt_model_profile(self, source: Any) -> None:
+        """Look up and record the :class:`ModelProfile` for a registered *source*.
+
+        Called from ``register_components``. The first recognised architecture
+        wins — with a shared manager across several pipelines they are normally
+        the same family, and a later differing profile would silently re-budget
+        components already placed under the first.
+        """
+        profile = get_model_profile(source)
+        if profile is None:
+            return
+        with self._lock:
+            if self._model_profile is profile:
+                return
+            if self._model_profile is not None:
+                logger.debug(
+                    "model profile for %s ignored — already using one from an earlier source",
+                    type(source).__name__,
+                )
+                return
+            self._model_profile = profile
+        logger.info(
+            "model profile: %s → denoiser_concurrency=%s%s (%s)",
+            type(source).__name__,
+            profile.denoiser_concurrency or "unset",
+            f", role overrides {dict(profile.roles)}" if profile.roles else "",
+            profile.note or "no note",
+        )
+
     def classify_components(self) -> list[ComponentInfo]:
         """Classify registered components by role (denoiser / text_encoder / vae / other).
 
         Detects how many denoisers and text encoders a pipeline has and their
         sizes — the inputs the size-aware resolver and block_pin budgeting need
         for multi-DiT / multi-text-encoder pipelines. See ``inventory.py``.
+
+        Role overrides from the registered pipeline's
+        :class:`~diffusers_mm.model_profiles.ModelProfile` win over the
+        name/structure heuristics.
         """
         with self._lock:
             components = dict(self._managed_components)
-        return build_inventory(components, self.AUTO_BLOCK_PIN_MIN_BLOCKS)
+            overrides = self._model_profile.roles if self._model_profile is not None else None
+        return build_inventory(components, self.AUTO_BLOCK_PIN_MIN_BLOCKS, role_overrides=overrides)
 
     def _concurrent_working_set_gb(self) -> float:
         """Peak concurrently-resident weight footprint (GiB), by role.
@@ -1252,36 +1332,7 @@ class ModelManager:
 
         # Free the overage plus a little slack so we land under the ceiling.
         need_gb = (reserved_gb - target_gb) + self._block_pin_spill_margin_gb
-        pinned.sort(key=lambda item: item[1].n_pinned, reverse=True)
-
-        offload_kwargs = self._group_offload_kwargs(dev)
-        freed_gb = 0.0
-        evicted_total = 0
-        for name, st in pinned:
-            if freed_gb >= need_gb:
-                break
-            blocks = getattr(st.component, st.block_attr, None)
-            if blocks is None or len(blocks) == 0:
-                continue
-            per_block_gb = per_block_size_bytes(blocks) / (1024**3)
-            if per_block_gb <= 0:
-                continue
-            k = math.ceil((need_gb - freed_gb) / per_block_gb)
-            old_n = st.n_pinned
-            # Targeted, in-place unpin: only the overflow block submodules gain
-            # streaming hooks — the top-level component's own hooks (incl. the
-            # step-1 calibration hook that may be calling us) are untouched, so
-            # this is safe to run mid-generation between denoising steps.
-            actually = unpin_blocks(st, k, offload_kwargs)
-            if actually == 0:
-                continue
-            # Persist the calibrated count so any later full re-apply reproduces it.
-            with self._lock:
-                self._block_pin_counts[name] = st.n_pinned
-            freed_gb += actually * per_block_gb
-            evicted_total += actually
-            logger.info("block_pin spill: %s %d → %d pinned blocks", name, old_n, st.n_pinned)
-
+        evicted_total, freed_gb = self._unpin_to_free_gb(need_gb, dev, reason="spill")
         if evicted_total == 0:
             return
 
@@ -1294,10 +1345,60 @@ class ModelManager:
             evicted_total,
             freed_gb,
         )
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         self._block_pin_spill_recalibrations += 1
+
+    def _unpin_to_free_gb(self, need_gb: float, device: torch.device, *, reason: str) -> tuple[int, float]:
+        """Unpin pinned blocks until ~*need_gb* of VRAM has been freed.
+
+        Shared by the Windows spill recalibration and the workload probe.
+        Walks pinned components most-pinned-first and calls
+        :func:`unpin_blocks` — a targeted, mid-generation-safe conversion of
+        pinned blocks into streamed ones (it only touches the overflow block
+        submodules, never the top-level component's own hook dict, so it is
+        safe from inside a hook on that component).
+
+        The calibrated count is persisted into ``_block_pin_counts`` so a later
+        full re-apply reproduces it. Releases the caching allocator's pool
+        afterwards, because the freed VRAM is only useful to the workload once
+        it is back with the driver.
+
+        Returns ``(blocks_unpinned, gb_freed)``.
+        """
+        with self._lock:
+            pinned = [(name, st) for name, st in self._block_pin_states.items() if st.n_pinned > 0]
+        if not pinned:
+            return 0, 0.0
+        pinned.sort(key=lambda item: item[1].n_pinned, reverse=True)
+
+        offload_kwargs = self._group_offload_kwargs(device)
+        freed_gb = 0.0
+        unpinned_total = 0
+        for name, st in pinned:
+            if freed_gb >= need_gb:
+                break
+            blocks = getattr(st.component, st.block_attr, None)
+            if blocks is None or len(blocks) == 0:
+                continue
+            per_block_gb = per_block_size_bytes(blocks) / (1024**3)
+            if per_block_gb <= 0:
+                continue
+            k = math.ceil((need_gb - freed_gb) / per_block_gb)
+            old_n = st.n_pinned
+            actually = unpin_blocks(st, k, offload_kwargs)
+            if actually == 0:
+                continue
+            # Persist the calibrated count so any later full re-apply reproduces it.
+            with self._lock:
+                self._block_pin_counts[name] = st.n_pinned
+            freed_gb += actually * per_block_gb
+            unpinned_total += actually
+            logger.info("block_pin %s: %s %d → %d pinned blocks", reason, name, old_n, st.n_pinned)
+
+        if unpinned_total:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return unpinned_total, freed_gb
 
     def _install_spill_calibration_hook(self, device: torch.device | str) -> None:
         """Register forward hooks that recalibrate after the first denoise step.
@@ -1350,6 +1451,208 @@ class ModelManager:
         handles = [comp.register_forward_hook(_calib_hook) for comp in denoisers]
         with self._lock:
             self._spill_calib_handles = handles
+
+    # A denoiser input tensor has to carry at least this many tokens before the
+    # probe treats it as the packed sequence. Filters out conditioning inputs
+    # (pooled embeds, short text embeds) that share the (B, S, C) layout.
+    _BLOCK_PIN_PROBE_MIN_SEQ_LEN = 256
+
+    @classmethod
+    def _infer_workload_from_inputs(cls, args: Any, kwargs: Any) -> tuple[int, int] | None:
+        """Infer ``(seq_len, batch)`` from a denoiser forward's inputs, or ``None``.
+
+        Looks for the token-sequence hidden state every modern DiT takes as
+        ``(batch, seq_len, channels)`` and returns the largest such tensor's
+        geometry — that is the sequence the activations scale with. Deliberately
+        narrow:
+
+        - ``ndim == 3`` only. UNet-style ``(B, C, H, W)`` / video ``(B, C, F, H,
+          W)`` inputs are skipped: their token count depends on model-specific
+          patchification we can't read off the tensor, and a wrong guess is worse
+          than no guess.
+        - ``seq_len`` must clear :attr:`_BLOCK_PIN_PROBE_MIN_SEQ_LEN` and exceed
+          the channel dim, which rejects text/pooled conditioning tensors.
+
+        Returning ``None`` leaves the existing budget untouched, so a model whose
+        inputs we can't read simply keeps today's behaviour.
+        """
+        candidates: list[Any] = list(args or ())
+        if isinstance(kwargs, dict):
+            candidates += list(kwargs.values())
+
+        best: tuple[int, int] | None = None
+        best_tokens = 0
+        for t in candidates:
+            if not isinstance(t, torch.Tensor) or t.ndim != 3 or not t.is_floating_point():
+                continue
+            batch, seq, channels = (int(d) for d in t.shape)
+            if seq < cls._BLOCK_PIN_PROBE_MIN_SEQ_LEN or seq <= channels:
+                continue
+            if batch * seq > best_tokens:
+                best_tokens = batch * seq
+                best = (seq, batch)
+        return best
+
+    def _recalibrate_for_observed_workload(self, args: Any, kwargs: Any, device: torch.device) -> None:
+        """Re-budget the pin count against the *actual* denoise workload.
+
+        Runs from a pre-forward hook on a block-pinned denoiser, i.e. after the
+        text encoder has had its turn but before a single activation of the
+        denoise step has been allocated — the one moment where both the true
+        sequence length and the true free VRAM are known.
+
+        Strictly a safety valve: it only ever *lowers* the pin count, and only
+        when the observed workload needs a bigger working set than whatever was
+        budgeted. A workload smaller than the recorded one is left alone so an
+        explicit :meth:`set_block_pin_workload` is never silently downgraded.
+        """
+        observed = self._infer_workload_from_inputs(args, kwargs)
+        if observed is None:
+            return
+        seq_len, batch = observed
+
+        with self._lock:
+            prev_seq = self._block_pin_seq_len
+            prev_batch = self._block_pin_batch
+            scale = self._block_pin_activation_scale
+        if (seq_len, batch) == (prev_seq, prev_batch):
+            return  # Already budgeted for exactly this workload.
+
+        current_need_gb = self._resolve_working_set_gb()
+        observed_act = self._activation_estimate_gb(seq_len, batch) * self._act_safety_factor()
+        observed_need_gb = observed_act + self._resolve_working_set_headroom_gb()
+        if observed_need_gb <= current_need_gb:
+            # The budget already reserves at least this much — don't downgrade it.
+            return
+
+        self.set_block_pin_workload(seq_len, batch, activation_scale=scale)
+        free_gb = self._effective_free_vram_gb(device)
+        logger.info(
+            "block_pin workload probe: observed seq_len=%d batch=%d (budgeted for %d/%d) → "
+            "working set %.2f → %.2f GiB, effective free %.2f GiB",
+            seq_len,
+            batch,
+            prev_seq,
+            prev_batch,
+            current_need_gb,
+            observed_need_gb,
+            free_gb,
+        )
+        if free_gb <= 0 or free_gb >= observed_need_gb:
+            return  # Detection failed, or the pin count already leaves enough room.
+
+        unpinned, freed_gb = self._unpin_to_free_gb(observed_need_gb - free_gb, device, reason="workload probe")
+        if unpinned == 0:
+            logger.warning(
+                "block_pin workload probe: seq_len=%d needs ~%.1f GiB working set but only %.1f GiB is free "
+                "and there are no pinned blocks left to unpin. This workload may OOM — "
+                "consider a smaller resolution/duration or strategy='group_offload'.",
+                seq_len,
+                observed_need_gb,
+                free_gb,
+            )
+            return
+        logger.info(
+            "block_pin workload probe: unpinned %d block(s) (~%.1f GiB) → effective free %.2f GiB",
+            unpinned,
+            freed_gb,
+            self._effective_free_vram_gb(device),
+        )
+
+    def _keep_resident_instead_of_offload(self, name: str, mod: Any, device: torch.device | str) -> bool:
+        """Move *mod* fully onto *device* instead of group-offloading it, if it must be.
+
+        Returns True when the component was made resident and the caller should
+        skip ``apply_group_offloading`` for it.
+
+        Today the only such case is legacy ``torch.nn.utils.weight_norm``, which
+        group offloading cannot serve at all — see
+        :func:`diffusers_mm.hooks.find_legacy_weight_norm` for the mechanism.
+        Streaming those weights produces a CPU/CUDA device mismatch on the first
+        forward, so residency is the only working placement; the affected
+        components in practice are small audio autoencoders / vocoders.
+
+        Logged at warning level because it silently raises the VRAM floor: the
+        caller asked for this component to be offloaded and it won't be.
+        """
+        wn = find_legacy_weight_norm(mod)
+        if wn is None:
+            return False
+        size_gb = 0.0
+        try:
+            size_gb = sum(p.numel() * p.element_size() for p in mod.parameters()) / (1024**3)
+            size_gb += sum(b.numel() * b.element_size() for b in mod.buffers()) / (1024**3)
+        except Exception:
+            pass
+        try:
+            mod.to(device)
+        except Exception as e:
+            logger.warning("Failed to make %s resident despite legacy weight_norm: %s", name, e)
+            return False
+        logger.warning(
+            "%s uses legacy torch.nn.utils.weight_norm (at %r), which is incompatible with "
+            "group offloading — its recomputed `weight` would stay on the CPU. Keeping it "
+            "resident on %s instead (%.2f GiB of VRAM).",
+            name,
+            wn,
+            device,
+            size_gb,
+        )
+        return True
+
+    def _install_block_pin_workload_probe(self, device: torch.device | str) -> None:
+        """Register a one-shot pre-forward probe on each block-pinned denoiser.
+
+        The apply-time block_pin budget has to guess the activation footprint:
+        unless the caller recorded the job with :meth:`set_block_pin_workload`,
+        it falls back to :attr:`AUTO_BLOCK_PIN_ACT_FALLBACK_GB` — an image-scale
+        figure. A long/large video sequence needs several times that, so the
+        budget over-pins and the first denoise step OOMs.
+
+        The probe closes that gap without asking the caller for anything: the
+        denoiser's own input tensor states the true sequence length, and a
+        *pre*-forward hook reads it before any activation is allocated, so the
+        pin count can still be lowered in time. Model-agnostic (no per-pipeline
+        geometry maths) and works on standard and modular pipelines alike, since
+        it hooks the module rather than the pipeline's callback protocol.
+
+        Complements the Windows spill recalibration, which is reactive
+        (it measures oversubscription *after* a step) and can only help on a
+        platform that spills instead of OOMing.
+        """
+        if not self._block_pin_workload_probe or self._applied_strategy != "block_pin":
+            return
+        if not torch.cuda.is_available():
+            return
+        dev = torch.device(device) if isinstance(device, str) else device
+        if dev.type != "cuda":
+            return
+
+        with self._lock:
+            pinned = [st.component for st in self._block_pin_states.values() if st.n_pinned > 0]
+            for handle in self._workload_probe_handles:
+                handle.remove()
+            self._workload_probe_handles = []
+        if not pinned:
+            return
+
+        fired = {"done": False}
+
+        def _probe_hook(module, args, kwargs):
+            if fired["done"]:
+                return
+            fired["done"] = True
+            # Do NOT remove hooks from here — we're inside the iteration of this
+            # module's pre-hook dict. The ``done`` flag makes later fires
+            # no-ops; handles are cleared on the next apply / transition.
+            try:
+                self._recalibrate_for_observed_workload(args, kwargs, dev)
+            except Exception as e:  # never let calibration break a generation
+                logger.warning("block_pin workload probe failed: %s", e)
+
+        handles = [comp.register_forward_pre_hook(_probe_hook, with_kwargs=True) for comp in pinned]
+        with self._lock:
+            self._workload_probe_handles = handles
 
     def set_block_pin_count(self, component_name: str, count: int) -> None:
         """Override the number of blocks to pin on GPU for *component_name*.
@@ -1423,22 +1726,63 @@ class ModelManager:
             return self.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB
         return self.AUTO_BLOCK_PIN_WORKING_SET_GB
 
+    def _activation_fit(self) -> tuple[float, float, bool]:
+        """``(intercept_gb, slope_gb_per_ktoken, is_measured)`` for the architecture.
+
+        Resolution order, most specific first: an explicit ctor value → the
+        registered pipeline's :class:`ModelProfile` measurement → the class
+        default. The default has to cover every unmeasured architecture, and the
+        measured spread is wide (0.13 GiB/ktoken for LTX-2.3 / Krea 2 up to 0.60
+        for Ideogram4, whose per-token LLM features dominate), so a profile
+        measurement should be preferred wherever one exists.
+        """
+        intercept = self.AUTO_BLOCK_PIN_ACT_INTERCEPT_GB
+        slope = self.AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN
+        measured = False
+        profile = self._model_profile
+        if profile is not None:
+            if not self._explicit_act_slope and profile.act_slope_gb_per_ktoken is not None:
+                slope = profile.act_slope_gb_per_ktoken
+                measured = True
+            if not self._explicit_act_intercept and profile.act_intercept_gb is not None:
+                intercept = profile.act_intercept_gb
+        return intercept, slope, measured
+
+    def _act_safety_factor(self) -> float:
+        """Multiplier applied to the activation estimate before platform headroom.
+
+        A **measured** slope needs far less cushion than the generic default:
+        most of :attr:`AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR` exists to cover not
+        knowing the architecture's real activation cost. Keeping 1.5x on top of a
+        measurement double-counts badly enough to invert the fix — on MiniMax-H3
+        at 104k tokens it reserves more than the card has and pins zero blocks.
+        An explicit ``auto_block_pin_act_safety_factor=`` still wins.
+        """
+        if self._explicit_act_safety_factor:
+            return self.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR
+        return (
+            self.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR_MEASURED
+            if self._activation_fit()[2]
+            else (self.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR)
+        )
+
     def _activation_estimate_gb(self, seq_len: int, batch: int) -> float:
         """Estimated transformer activation VRAM (GB) for a denoise forward.
 
         Linear fit ``intercept + slope × ktokens`` (``ktokens = batch ×
-        seq_len / 1000``), scaled by the recorded ``activation_scale``.
-        Activations are bf16 regardless of weight quantization, so the fit
-        generalises across dtypes. Returns the fixed fallback when ``seq_len``
-        is unknown.
+        seq_len / 1000``), scaled by the recorded ``activation_scale``, using the
+        registered architecture's measured fit where one is known (see
+        :meth:`_activation_fit`). Activations are bf16 regardless of weight
+        quantization, so the fit generalises across dtypes. Returns the fixed
+        fallback when ``seq_len`` is unknown.
         """
         with self._lock:
             scale = self._block_pin_activation_scale
         if seq_len <= 0:
             return self.AUTO_BLOCK_PIN_ACT_FALLBACK_GB * scale
         ktokens = (batch * seq_len) / 1000.0
-        base = self.AUTO_BLOCK_PIN_ACT_INTERCEPT_GB + self.AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN * ktokens
-        return base * scale
+        intercept, slope, _ = self._activation_fit()
+        return (intercept + slope * ktokens) * scale
 
     def _resolve_working_set_gb(self) -> float:
         """Working-set VRAM (GB) to reserve per block_pin component.
@@ -1454,7 +1798,7 @@ class ModelManager:
         with self._lock:
             seq_len = self._block_pin_seq_len
             batch = self._block_pin_batch
-        act = self._activation_estimate_gb(seq_len, batch) * self.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR
+        act = self._activation_estimate_gb(seq_len, batch) * self._act_safety_factor()
         return act + self._resolve_working_set_headroom_gb()
 
     def _compute_block_pin_count(
@@ -1771,6 +2115,16 @@ class ModelManager:
             if state.resident:
                 evict_pinned_subset(state)
                 evicted += 1
+        if evicted:
+            # Hand the freed pages back to the driver. Eviction only returns them
+            # to PyTorch's caching allocator, and the neighbor we just made room
+            # for may need memory PyTorch's pool cannot serve: cuDNN convolution
+            # workspaces, Triton scratch and every other non-PyTorch allocator go
+            # straight to the driver. A video VAE decode hits exactly that path
+            # and fails with an opaque CUDNN_STATUS_INTERNAL_ERROR (not an OOM)
+            # when the pool is still holding the card.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         logger.info(
             "block_pin: evicted %d subset(s) for %r (free=%.2f GiB, threshold=%.2f GiB, override=%r)",
             evicted,
@@ -1920,6 +2274,8 @@ class ModelManager:
             self._block_pin_hook_handles.clear()
             handles += list(self._spill_calib_handles)
             self._spill_calib_handles = []
+            handles += list(self._workload_probe_handles)
+            self._workload_probe_handles = []
             wrapped = list(self._block_pin_wrapped_methods)
             self._block_pin_wrapped_methods.clear()
             states = list(self._block_pin_states.values())
@@ -2106,6 +2462,8 @@ class ModelManager:
             for name, mod in unique:
                 try:
                     remove_offload_hooks(mod)
+                    if self._keep_resident_instead_of_offload(name, mod, device):
+                        continue
                     apply_group_offloading(mod, **offload_kwargs)
                     logger.info("group_offload (leaf_level) enabled for %s", name)
                 except Exception as e:
@@ -2138,6 +2496,8 @@ class ModelManager:
                     # No discoverable repeated-block list — fall back to
                     # plain leaf-level group offload for this component.
                     try:
+                        if self._keep_resident_instead_of_offload(name, mod, device):
+                            continue
                         apply_group_offloading(mod, **offload_kwargs)
                         logger.info(
                             "block_pin: %s has no block list, fell back to group_offload",
@@ -2171,6 +2531,11 @@ class ModelManager:
                     logger.warning("block_pin: failed for %s: %s", name, e)
 
             self._install_block_pin_auto_evict(new_pinned, new_neighbors, device_obj)
+            # Read the true sequence length off the denoiser's first input and
+            # lower the pin count before any activation is allocated. This is
+            # what keeps an unrecorded (or under-recorded) workload from
+            # over-pinning and OOMing on the first step.
+            self._install_block_pin_workload_probe(device_obj)
             # Windows: probe VRAM after the first denoise step and unpin if it
             # oversubscribes, instead of waiting for the whole (slow) generation.
             self._install_spill_calibration_hook(device_obj)

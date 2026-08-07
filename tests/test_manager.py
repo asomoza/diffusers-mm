@@ -18,7 +18,14 @@ from diffusers_mm.block_pin import (
     per_block_size_bytes,
     repin_pinned_subset,
 )
+from diffusers_mm.hooks import find_legacy_weight_norm
 from diffusers_mm.manager import ModelManager, get_device, get_dtype
+from diffusers_mm.model_profiles import (
+    MODEL_PROFILES,
+    ModelProfile,
+    get_model_profile,
+    register_model_profile,
+)
 from diffusers_mm.offload_defaults import block_pin_activation_scale
 
 
@@ -81,7 +88,7 @@ class TestAutoTuningCtorArgs:
         assert mm.AUTO_BLOCK_PIN_MIN_BLOCKS == 8
         assert mm.AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB == 4.0
         assert mm.AUTO_BLOCK_PIN_ACT_INTERCEPT_GB == 0.30
-        assert mm.AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN == 0.118
+        assert mm.AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN == 0.16
         assert mm.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR == 1.5
         assert mm.AUTO_BLOCK_PIN_ACT_FALLBACK_GB == 4.0
         # No instance attribute shadow exists when defaults were used.
@@ -1038,6 +1045,290 @@ class TestLargestBlockListInfo:
         assert mm._largest_component_has_block_list() is False
 
 
+class _FakeSource:
+    """Minimal pipeline-like source: exposes ``.components`` so
+    ``register_components`` accepts it, and carries a class name the
+    ModelProfile registry can key on."""
+
+    def __init__(self, components):
+        self.components = components
+
+
+class WanPipeline(_FakeSource):
+    """Name matches the shipped profile (timestep-split experts)."""
+
+
+class Ideogram4Pipeline(_FakeSource):
+    """Name matches the shipped profile (True-CFG dual DiT)."""
+
+
+class MiniMaxH3ModularPipeline(_FakeSource):
+    """Name matches the shipped profile (alternative checkpoint partitions)."""
+
+
+class Krea2TurboModularPipeline(_FakeSource):
+    """Name matches the shipped profile (measured slope + real fixed cost)."""
+
+
+class TotallyUnknownPipeline(_FakeSource):
+    """No profile — must fall back to the co_resident default."""
+
+
+class TestModelProfileRegistry:
+    """The profile table itself: lookup, validation, extensibility."""
+
+    def test_known_pipelines_resolve(self):
+        assert get_model_profile("WanPipeline").denoiser_concurrency == "sequential"
+        assert get_model_profile("LucyEditPipeline").denoiser_concurrency == "sequential"
+        assert get_model_profile("Ideogram4Pipeline").denoiser_concurrency == "co_resident"
+        assert get_model_profile("Ideogram4ModularPipeline").denoiser_concurrency == "co_resident"
+        assert get_model_profile("MiniMaxH3ModularPipeline").denoiser_concurrency == "sequential"
+
+    def test_unknown_pipeline_is_none(self):
+        assert get_model_profile("SomePipelineWeveNeverSeen") is None
+
+    def test_lookup_accepts_instance_and_class(self):
+        assert get_model_profile(WanPipeline({})) is get_model_profile("WanPipeline")
+        assert get_model_profile(WanPipeline) is get_model_profile("WanPipeline")
+
+    def test_lookup_walks_mro_for_subclasses(self):
+        class MyWanVariantPipeline(WanPipeline):
+            pass
+
+        assert get_model_profile(MyWanVariantPipeline).denoiser_concurrency == "sequential"
+
+    def test_minimax_h3_carries_transformer_ref_role_hint(self):
+        assert get_model_profile("MiniMaxH3ModularPipeline").roles["transformer_ref"] == "denoiser"
+
+    def test_register_custom_profile(self):
+        try:
+            register_model_profile("MyCustomPipeline", ModelProfile(denoiser_concurrency="sequential"))
+            assert get_model_profile("MyCustomPipeline").denoiser_concurrency == "sequential"
+        finally:
+            MODEL_PROFILES.pop("MyCustomPipeline", None)
+
+    def test_register_rejects_non_profile(self):
+        with pytest.raises(TypeError):
+            register_model_profile("Bad", "sequential")
+
+    def test_profile_validates_concurrency(self):
+        with pytest.raises(ValueError, match="denoiser_concurrency"):
+            ModelProfile(denoiser_concurrency="whenever")
+
+    def test_profile_validates_roles(self):
+        with pytest.raises(ValueError, match="role for"):
+            ModelProfile(roles={"transformer": "denoizer"})
+
+    def test_wan_modular_variants_covered(self):
+        # The Wan 2.2 modular pipelines switch experts on boundary_timestep in
+        # modular_pipelines/wan/denoise.py, exactly like the standard ones.
+        for name in ("WanModularPipeline", "Wan22ModularPipeline", "Wan22Image2VideoModularPipeline"):
+            assert get_model_profile(name).denoiser_concurrency == "sequential", name
+
+    def test_installed_multi_denoiser_pipelines_are_profiled(self):
+        """Guard against a new multi-DiT architecture landing unprofiled.
+
+        Scans the installed diffusers for pipelines declaring two or more
+        denoiser-typed components and asserts each has a profile. An unprofiled
+        one silently falls back to ``co_resident``, which over-reserves for a
+        sequential pipeline — the failure this table exists to prevent. If this
+        fails, verify the new pipeline's concurrency **in the diffusers source**
+        and add an entry; don't infer it from the component names.
+
+        Only inspects ``__init__`` signatures, so it cannot see modular
+        pipelines (they declare components via ComponentSpec) — those still need
+        the manual sweep.
+        """
+        import inspect
+
+        import diffusers
+
+        denoiser_types = ("UNet", "Transformer2DModel", "PriorTransformer", "WanTransformer")
+        # Legacy families we deliberately don't profile: small staged priors
+        # (~1-2 GB) where co_resident over-reserving changes no strategy
+        # decision, plus the deprecated VersatileDiffusion dual-unet pipelines.
+        exempt_prefixes = (
+            "UnCLIP",
+            "StableUnCLIP",
+            "Kandinsky",
+            "Wuerstchen",
+            "StableCascade",
+            "VersatileDiffusion",
+        )
+        unprofiled = []
+        for name in dir(diffusers):
+            obj = getattr(diffusers, name, None)
+            if not inspect.isclass(obj) or not name.endswith("Pipeline"):
+                continue
+            if name in MODEL_PROFILES or name.startswith(exempt_prefixes):
+                continue
+            try:
+                params = list(inspect.signature(obj.__init__).parameters.items())[1:]
+            except (TypeError, ValueError):
+                continue
+            n = sum(1 for _, p in params if any(k in getattr(p.annotation, "__name__", "") for k in denoiser_types))
+            if n >= 2:
+                unprofiled.append(name)
+        assert not unprofiled, f"multi-denoiser pipelines without a ModelProfile: {sorted(unprofiled)}"
+
+    def test_measured_slopes_present(self):
+        # Values from demo_scripts/measure_activation_slope.py (2026-08).
+        for name, expected in (
+            ("LTX2Pipeline", 0.136),
+            ("Krea2TurboModularPipeline", 0.134),
+            ("MiniMaxH3ModularPipeline", 0.158),
+            ("Ideogram4Pipeline", 0.603),
+        ):
+            assert get_model_profile(name).act_slope_gb_per_ktoken == pytest.approx(expected), name
+
+    def test_profile_rejects_bad_activation_fit(self):
+        with pytest.raises(ValueError, match="act_slope"):
+            ModelProfile(act_slope_gb_per_ktoken=0.0)
+        with pytest.raises(ValueError, match="act_intercept"):
+            ModelProfile(act_intercept_gb=-1.0)
+
+    def test_every_shipped_profile_is_valid(self):
+        # The dataclass validates on construction, so this mostly guards against
+        # a future entry being added as a raw dict or with a stray mode.
+        for name, profile in MODEL_PROFILES.items():
+            assert isinstance(profile, ModelProfile), name
+            assert profile.denoiser_concurrency in (None, "co_resident", "sequential"), name
+            assert profile.note, f"{name} should say why it claims what it claims"
+
+
+class TestModelProfileAdoption:
+    """Registering a recognised pipeline configures the manager for it."""
+
+    def test_profile_sets_concurrency(self):
+        mm = ModelManager()
+        assert mm.denoiser_concurrency == "co_resident"  # default before registration
+        source = WanPipeline({"transformer": DummyModel()})
+        mm.register_components(source)
+        assert mm.denoiser_concurrency == "sequential"
+
+    def test_explicit_ctor_value_beats_profile(self):
+        mm = ModelManager(denoiser_concurrency="co_resident")
+        source = WanPipeline({"transformer": DummyModel()})
+        mm.register_components(source)
+        # Wan's profile says sequential, but the caller was explicit.
+        assert mm.denoiser_concurrency == "co_resident"
+
+    def test_unknown_pipeline_keeps_default(self):
+        mm = ModelManager()
+        source = TotallyUnknownPipeline({"transformer": DummyModel()})
+        mm.register_components(source)
+        assert mm._model_profile is None
+        assert mm.denoiser_concurrency == "co_resident"
+
+    def test_dict_source_has_no_profile(self):
+        mm = ModelManager()
+        mm.register_components({"transformer": DummyModel()})
+        assert mm._model_profile is None
+
+    def test_first_profile_wins_on_shared_manager(self):
+        mm = ModelManager()
+        first = WanPipeline({"transformer": DummyModel()})
+        second = Ideogram4Pipeline({"vae": DummyModel()})
+        mm.register_components(first)
+        mm.register_components(second)
+        assert mm.denoiser_concurrency == "sequential"
+
+    def test_role_override_applied_to_inventory(self):
+        mm = ModelManager()
+        # A block-less transformer_ref would classify as "other" without the hint.
+        source = MiniMaxH3ModularPipeline({"transformer_ref": DummyModel()})
+        mm.register_components(source)
+        roles = {c.name: c.role for c in mm.classify_components()}
+        assert roles["transformer_ref"] == "denoiser"
+
+    def test_setter_still_validates(self):
+        mm = ModelManager()
+        with pytest.raises(ValueError, match="denoiser_concurrency"):
+            mm.denoiser_concurrency = "occasionally"
+
+    def test_setter_none_restores_profile_default(self):
+        mm = ModelManager(denoiser_concurrency="co_resident")
+        source = WanPipeline({"transformer": DummyModel()})
+        mm.register_components(source)
+        assert mm.denoiser_concurrency == "co_resident"
+        mm.denoiser_concurrency = None
+        assert mm.denoiser_concurrency == "sequential"
+
+    def test_profile_slope_drives_the_activation_estimate(self):
+        mm = ModelManager()
+        # Unknown architecture -> the class default (0.16).
+        assert mm._activation_fit() == (0.30, 0.16, False)
+        assert mm._activation_estimate_gb(100_000, 1) == pytest.approx(0.30 + 0.16 * 100)
+
+        source = Ideogram4Pipeline({"transformer": DummyModel()})
+        mm.register_components(source)
+        # Ideogram4's measured slope is ~3.8x the default; using the default here
+        # would under-budget its activations by that factor.
+        assert mm._activation_fit() == (0.30, 0.603, True)
+        assert mm._activation_estimate_gb(100_000, 1) == pytest.approx(0.30 + 0.603 * 100)
+
+    def test_profile_intercept_applied_when_measured(self):
+        mm = ModelManager()
+        source = Krea2TurboModularPipeline({"transformer": DummyModel()})
+        mm.register_components(source)
+        # Krea 2 is the one model measured with a real fixed cost.
+        assert mm._activation_fit() == (0.10, 0.134, True)
+
+    def test_explicit_ctor_slope_beats_profile(self):
+        mm = ModelManager(auto_block_pin_act_slope_gb_per_ktoken=0.25)
+        source = Ideogram4Pipeline({"transformer": DummyModel()})
+        mm.register_components(source)
+        intercept, slope, measured = mm._activation_fit()
+        assert slope == 0.25  # caller wins over the measurement
+        assert measured is False  # so the generous unmeasured safety factor still applies
+        assert intercept == 0.30  # intercept untouched, so the profile can't set it either
+
+    def test_profile_without_slope_keeps_default(self):
+        mm = ModelManager()
+        source = WanPipeline({"transformer": DummyModel()})
+        mm.register_components(source)
+        # Wan has a concurrency profile but no measured slope yet.
+        assert get_model_profile("WanPipeline").act_slope_gb_per_ktoken is None
+        assert mm._activation_fit() == (0.30, 0.16, False)
+
+    def test_measured_slope_uses_the_tighter_safety_factor(self):
+        """A measured slope must not also carry the unmeasured cushion.
+
+        1.5x exists to cover not knowing the architecture's slope. Applying it on
+        top of a measurement over-reserves so badly it inverts the fix: on
+        MiniMax-H3 at 104k tokens it reserves more than a 32 GiB card has and
+        pins zero blocks, which is worse than the under-budget it replaced.
+        """
+        mm = ModelManager()
+        assert mm._act_safety_factor() == 1.5  # unmeasured architecture
+        source = MiniMaxH3ModularPipeline({"transformer": DummyModel()})
+        mm.register_components(source)
+        assert mm._act_safety_factor() == 1.2
+
+        # ...and the tighter factor must leave room to actually pin blocks.
+        mm.set_block_pin_workload(103_966, batch=1)
+        assert mm._resolve_working_set_gb() < 27.0
+
+    def test_explicit_safety_factor_beats_the_measured_default(self):
+        mm = ModelManager(auto_block_pin_act_safety_factor=1.8)
+        source = MiniMaxH3ModularPipeline({"transformer": DummyModel()})
+        mm.register_components(source)
+        assert mm._act_safety_factor() == 1.8
+
+    def test_profile_changes_the_resolved_strategy(self, monkeypatch):
+        # Same hardware and same two block-bearing denoisers as
+        # TestCoResidentDenoiserGuard: co_resident redirects away from
+        # model_offload, sequential permits it. The only input is the profile.
+        _patch_vram(monkeypatch, 16.0)
+        mm = ModelManager(strategy="auto")
+        mm._estimate_components_size_gb = lambda: (20.0, 10.0)
+        source = WanPipeline({"transformer": _BlockyDenoiser(), "transformer_2": _BlockyDenoiser()})
+        mm.register_components(source)
+        assert mm.denoiser_concurrency == "sequential"
+        assert mm._coresident_denoiser_count() == 0
+        assert mm.resolve_offload_strategy("cuda") == "model_offload"
+
+
 class TestCoResidentDenoiserGuard:
     """auto must not pick model_offload when ≥2 denoisers are co-resident.
 
@@ -1695,7 +1986,7 @@ class TestBlockPinCount:
 
         mm = ModelManager()
         baseline = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
-        # seq_len = 100k tokens, batch 2 → 200 ktokens → act ≈ 0.30 + 0.118×200
+        # seq_len = 100k tokens, batch 2 → 200 ktokens → act ≈ 0.30 + 0.16×200
         # = 23.9, × 1.5 + 2.0 ≈ 37.8 GiB working set → far fewer blocks.
         mm.set_block_pin_workload(100_000, batch=2)
         loaded = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
@@ -1747,9 +2038,9 @@ class TestWorkloadAwareWorkingSet:
         monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
         mm = ModelManager()
         # seq_len = 10_000, batch 2 → 20 ktokens.
-        # act = 0.30 + 0.118 × 20 = 2.66; × 1.5 + 2.0 = 5.99.
+        # act = 0.30 + 0.16 × 20 = 3.50; × 1.5 + 2.0 = 7.25.
         mm.set_block_pin_workload(10_000, batch=2)
-        assert mm._resolve_working_set_gb() == pytest.approx((0.30 + 0.118 * 20.0) * 1.5 + 2.0)
+        assert mm._resolve_working_set_gb() == pytest.approx((0.30 + 0.16 * 20.0) * 1.5 + 2.0)
 
     def test_activation_scale_inflates_estimate(self, monkeypatch):
         monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
@@ -2467,6 +2758,214 @@ class TestBlockPinAutoEvictRamAware:
         expected = 2 * per_block_size_bytes(transformer.blocks) + non_block_size_bytes(transformer, "blocks")
         assert state.pinned_size_bytes == expected
         assert state.pinned_size_bytes > 0
+
+
+class TestInferWorkloadFromInputs:
+    """The probe reads the true sequence length off the denoiser's own input."""
+
+    def test_picks_token_sequence_from_args(self):
+        hidden = torch.zeros(1, 4096, 64)
+        assert ModelManager._infer_workload_from_inputs((hidden,), {}) == (4096, 1)
+
+    def test_reads_kwargs_too(self):
+        hidden = torch.zeros(2, 8192, 64)
+        assert ModelManager._infer_workload_from_inputs((), {"hidden_states": hidden}) == (8192, 2)
+
+    def test_picks_largest_token_count(self):
+        small = torch.zeros(1, 512, 64)
+        big = torch.zeros(1, 9000, 64)
+        assert ModelManager._infer_workload_from_inputs((small, big), {}) == (9000, 1)
+
+    def test_batch_counts_toward_token_total(self):
+        wide_batch = torch.zeros(4, 3000, 64)  # 12000 tokens
+        long_seq = torch.zeros(1, 9000, 64)  # 9000 tokens
+        assert ModelManager._infer_workload_from_inputs((wide_batch, long_seq), {}) == (3000, 4)
+
+    def test_rejects_short_conditioning_tensors(self):
+        # A text-embedding-shaped tensor must not be mistaken for the sequence.
+        text_embeds = torch.zeros(1, 77, 4096)
+        assert ModelManager._infer_workload_from_inputs((text_embeds,), {}) is None
+
+    def test_rejects_channel_major_tensor(self):
+        # seq must exceed the channel dim, else it's not a token sequence.
+        assert ModelManager._infer_workload_from_inputs((torch.zeros(1, 300, 4096),), {}) is None
+
+    def test_ignores_non_3d_and_non_float(self):
+        latents_5d = torch.zeros(1, 24, 102, 48, 84)
+        ids = torch.zeros(1, 4096, 64, dtype=torch.long)
+        assert ModelManager._infer_workload_from_inputs((latents_5d, ids, "text", None), {}) is None
+
+    def test_no_candidates_returns_none(self):
+        assert ModelManager._infer_workload_from_inputs((), {}) is None
+
+
+class TestBlockPinWorkloadProbe:
+    """The probe must lower an over-pinned budget before the first denoise
+    step allocates anything. Without it, an unrecorded workload falls back to
+    the image-scale AUTO_BLOCK_PIN_ACT_FALLBACK_GB, over-pins, and OOMs
+    (reproduced on MiniMax-H3 at 768x1344x345f on a 32 GiB card)."""
+
+    def _mm(self, monkeypatch, *, free_gb):
+        _stub_group_offload(monkeypatch)
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_effective_free_vram_gb", lambda d: free_gb)
+        return mm
+
+    def test_large_workload_unpins_blocks(self, monkeypatch):
+        mm = self._mm(monkeypatch, free_gb=1.0)
+        transformer = _FakeTransformer()
+        mm.register_component("transformer", transformer)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+        state = mm._block_pin_states["transformer"]
+        assert state.n_pinned == 3
+
+        # A 100k-token sequence needs far more than the 8.0 GiB fallback
+        # reserve, and only 1 GiB is free → the probe must unpin.
+        hidden = torch.zeros(1, 100_000, 64)
+        mm._recalibrate_for_observed_workload((hidden,), {}, torch.device("cpu"))
+
+        assert mm._block_pin_seq_len == 100_000
+        assert state.n_pinned < 3
+        # The calibrated count is persisted for any later re-apply.
+        assert mm._block_pin_counts["transformer"] == state.n_pinned
+
+    def test_ample_free_vram_keeps_pins(self, monkeypatch):
+        mm = self._mm(monkeypatch, free_gb=500.0)
+        transformer = _FakeTransformer()
+        mm.register_component("transformer", transformer)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+        state = mm._block_pin_states["transformer"]
+
+        hidden = torch.zeros(1, 100_000, 64)
+        mm._recalibrate_for_observed_workload((hidden,), {}, torch.device("cpu"))
+
+        # Workload still recorded, but nothing needed to be freed.
+        assert mm._block_pin_seq_len == 100_000
+        assert state.n_pinned == 3
+
+    def test_smaller_observed_workload_does_not_downgrade_budget(self, monkeypatch):
+        mm = self._mm(monkeypatch, free_gb=1.0)
+        transformer = _FakeTransformer()
+        mm.register_component("transformer", transformer)
+        mm.set_block_pin_count("transformer", 3)
+        # Caller explicitly recorded a big workload.
+        mm.set_block_pin_workload(200_000, batch=1)
+        mm.apply_offload_strategy("cpu")
+        state = mm._block_pin_states["transformer"]
+        n_before = state.n_pinned
+
+        # A smaller observed sequence must not shrink the reserve the caller asked for.
+        mm._recalibrate_for_observed_workload((torch.zeros(1, 10_000, 64),), {}, torch.device("cpu"))
+
+        assert mm._block_pin_seq_len == 200_000
+        assert state.n_pinned == n_before
+
+    def test_unreadable_inputs_leave_budget_untouched(self, monkeypatch):
+        mm = self._mm(monkeypatch, free_gb=1.0)
+        transformer = _FakeTransformer()
+        mm.register_component("transformer", transformer)
+        mm.set_block_pin_count("transformer", 3)
+        mm.apply_offload_strategy("cpu")
+        state = mm._block_pin_states["transformer"]
+
+        # 5-D video latents: token count isn't readable off the tensor → no-op.
+        mm._recalibrate_for_observed_workload((torch.zeros(1, 24, 102, 48, 84),), {}, torch.device("cpu"))
+
+        assert mm._block_pin_seq_len == 0
+        assert state.n_pinned == 3
+
+    def test_probe_installed_only_for_block_pin(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        mm.register_component("transformer", _FakeTransformer())
+        mm.set_block_pin_count("transformer", 2)
+        mm.apply_offload_strategy("cpu")
+        # cpu device → probe declines to install (it needs CUDA to read free VRAM).
+        assert mm._workload_probe_handles == []
+
+    def test_probe_can_be_disabled(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin", block_pin_workload_probe=False)
+        mm.register_component("transformer", _FakeTransformer())
+        mm.apply_offload_strategy("cpu")
+        assert mm._block_pin_workload_probe is False
+        assert mm._workload_probe_handles == []
+
+
+class _WeightNormVAE(nn.Module):
+    """Mimics a diffusers audio autoencoder / vocoder: legacy weight_norm."""
+
+    def __init__(self):
+        super().__init__()
+        from torch.nn.utils import weight_norm
+
+        self.conv_pre = weight_norm(nn.Conv1d(4, 4, 3))
+
+    def forward(self, x):
+        return self.conv_pre(x)
+
+    def decode(self, x):
+        return self.conv_pre(x)
+
+
+class TestLegacyWeightNormGuard:
+    """Legacy ``torch.nn.utils.weight_norm`` cannot be group-offloaded: its
+    pre-forward hook recomputes ``weight`` (a plain attribute, not a
+    Parameter) before the offload wrapper onloads ``weight_g`` / ``weight_v``,
+    so the op sees a CPU weight against a CUDA input. Such components must be
+    kept resident instead. Hit on MiniMax-H3's ``audio_vae``."""
+
+    def test_detects_legacy_weight_norm(self):
+        assert find_legacy_weight_norm(_WeightNormVAE()) == "conv_pre"
+
+    def test_plain_module_is_not_flagged(self):
+        assert find_legacy_weight_norm(_FakeTransformer()) is None
+
+    def test_modern_parametrization_is_not_flagged(self):
+        from torch.nn.utils.parametrizations import weight_norm as modern_weight_norm
+
+        class Modern(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = modern_weight_norm(nn.Conv1d(4, 4, 3))
+
+        assert find_legacy_weight_norm(Modern()) is None
+
+    def test_group_offload_strategy_keeps_it_resident(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "diffusers.hooks.group_offloading.apply_group_offloading",
+            lambda mod, **kwargs: calls.append(mod),
+        )
+        mm = ModelManager(strategy="group_offload")
+        audio_vae = _WeightNormVAE()
+        mm.register_component("audio_vae", audio_vae)
+        mm.register_component("text_encoder", _FakeTextEncoder())
+        mm.apply_offload_strategy("cpu")
+
+        # The weight_norm component is skipped; the plain one is offloaded.
+        assert audio_vae not in calls
+        assert len(calls) == 1
+
+    def test_block_pin_fallback_keeps_it_resident(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "diffusers.hooks.group_offloading.apply_group_offloading",
+            lambda mod, **kwargs: calls.append(mod),
+        )
+        mm = ModelManager(strategy="block_pin")
+        audio_vae = _WeightNormVAE()
+        mm.register_component("audio_vae", audio_vae)
+        mm.apply_offload_strategy("cpu")
+
+        assert audio_vae not in calls
+        # Not registered as an evict-triggering neighbor either — it never
+        # got offload hooks, so there is nothing for the auto-evict machinery
+        # to coordinate with.
+        assert "audio_vae" not in mm._block_pin_states
 
 
 class TestTransformerOffloadCycle:
