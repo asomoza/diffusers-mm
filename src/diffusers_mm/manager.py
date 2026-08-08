@@ -185,6 +185,7 @@ class ModelManager:
         auto_block_pin_act_intercept_gb: float | None = None,
         auto_block_pin_act_slope_gb_per_ktoken: float | None = None,
         auto_block_pin_act_safety_factor: float | None = None,
+        auto_block_pin_act_safety_factor_measured: float | None = None,
         auto_block_pin_act_fallback_gb: float | None = None,
     ) -> None:
         """Construct a manager.
@@ -407,6 +408,8 @@ class ModelManager:
             self.AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN = float(auto_block_pin_act_slope_gb_per_ktoken)
         if auto_block_pin_act_safety_factor is not None:
             self.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR = float(auto_block_pin_act_safety_factor)
+        if auto_block_pin_act_safety_factor_measured is not None:
+            self.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR_MEASURED = float(auto_block_pin_act_safety_factor_measured)
         if auto_block_pin_act_fallback_gb is not None:
             self.AUTO_BLOCK_PIN_ACT_FALLBACK_GB = float(auto_block_pin_act_fallback_gb)
 
@@ -2488,16 +2491,47 @@ class ModelManager:
             # and which fell back to group_offload (gets evict hooks).
             new_pinned: list[tuple[str, Any, str, int]] = []
             new_neighbors: list[tuple[str, Any]] = []
+            try:
+                roles = {info.name: info.role for info in self.classify_components()}
+            except Exception:  # classification is best-effort; empty roles disables the guard below
+                roles = {}
             for name, mod in unique:
                 # Pre-clean any prior hooks so re-applying is safe (idempotent).
                 remove_offload_hooks(mod)
+                # Checked before block-list discovery: legacy `weight_norm` cannot be
+                # offloaded *or* partially pinned, so it must win over any block list the
+                # component happens to expose (audio VAEs have both).
+                if self._keep_resident_instead_of_offload(name, mod, device):
+                    continue
+                # Only denoisers are eligible for pinning. `_resolve_working_set_gb()` models the
+                # *denoiser's* activation footprint, so pinning another component's blocks spends
+                # VRAM that component's own activations still need — a transformer-decoder video
+                # VAE has a decode footprint of its own and would OOM against the denoiser's
+                # reserve.
+                #
+                # This is defense-in-depth rather than a behaviour change: `find_largest_block_list`
+                # only walks top-level children, and across the installed diffusers every one of the
+                # 65 denoisers (transformers/ + unets/) exposes its block list there while all 28
+                # VAEs and every transformers text encoder nest theirs (`decoder.blocks`,
+                # `text_model.encoder.layers`, `model.language_model.layers`). So non-denoisers
+                # already fell through to group_offload; this makes the intent explicit and covers a
+                # future model that does put a repeated-block list at the top level of a VAE.
+                #
+                # Must stay *after* the legacy-weight_norm check above: such components have to be
+                # kept resident, not group_offloaded by this branch.
+                if roles and roles.get(name) != "denoiser":
+                    try:
+                        apply_group_offloading(mod, **offload_kwargs)
+                        logger.info("block_pin: %s is not a denoiser, using group_offload", name)
+                        new_neighbors.append((name, mod))
+                    except Exception as e:
+                        logger.warning("Failed to enable group_offload for %s: %s", name, e)
+                    continue
                 result = find_largest_block_list(mod)
                 if result is None:
                     # No discoverable repeated-block list — fall back to
                     # plain leaf-level group offload for this component.
                     try:
-                        if self._keep_resident_instead_of_offload(name, mod, device):
-                            continue
                         apply_group_offloading(mod, **offload_kwargs)
                         logger.info(
                             "block_pin: %s has no block list, fell back to group_offload",

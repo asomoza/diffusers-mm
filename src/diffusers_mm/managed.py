@@ -45,6 +45,7 @@ def managed(
     auto_block_pin_act_intercept_gb: float = _UNSET,
     auto_block_pin_act_slope_gb_per_ktoken: float = _UNSET,
     auto_block_pin_act_safety_factor: float = _UNSET,
+    auto_block_pin_act_safety_factor_measured: float = _UNSET,
     auto_block_pin_act_fallback_gb: float = _UNSET,
 ) -> Any:
     """Wrap a diffusers pipeline with smart model management.
@@ -157,7 +158,14 @@ def managed(
             ``batch × seq_len`` tokens) of the activation fit. Default
             ``0.118``.
         auto_block_pin_act_safety_factor: Multiplier on the activation
-            estimate before adding the platform headroom. Default ``1.5``.
+            estimate before adding the platform headroom, used when the slope is
+            the generic default. Default ``1.5`` — most of which is cushion for
+            not knowing the architecture's real activation cost.
+        auto_block_pin_act_safety_factor_measured: The same multiplier, used
+            instead when the slope came from a measured
+            :class:`~diffusers_mm.model_profiles.ModelProfile`. Default ``1.2``:
+            a measurement needs far less cushion, and keeping ``1.5`` on top of
+            one over-reserves enough to pin no blocks at all on a long video.
         auto_block_pin_act_fallback_gb: Activation estimate (GiB) used
             when no workload has been recorded. Default ``4.0``.
 
@@ -192,6 +200,7 @@ def managed(
         "auto_block_pin_act_intercept_gb": auto_block_pin_act_intercept_gb,
         "auto_block_pin_act_slope_gb_per_ktoken": auto_block_pin_act_slope_gb_per_ktoken,
         "auto_block_pin_act_safety_factor": auto_block_pin_act_safety_factor,
+        "auto_block_pin_act_safety_factor_measured": auto_block_pin_act_safety_factor_measured,
         "auto_block_pin_act_fallback_gb": auto_block_pin_act_fallback_gb,
     }
     explicit = {k: v for k, v in config_kwargs.items() if v is not _UNSET}
