@@ -32,9 +32,16 @@ caller who knows better.
 
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
+
+logger = logging.getLogger(__name__)
+
+# MiniMax-H3's audio VAE latent rate, in latents per second of video.
+_MINIMAX_H3_AUDIO_LATENTS_PER_SECOND = 40
 
 # The two ways a pipeline's denoisers can share the step loop.
 DENOISER_CONCURRENCY_MODES = ("co_resident", "sequential")
@@ -64,6 +71,19 @@ class ModelProfile:
         act_intercept_gb: Measured fixed activation cost, overriding
             ``AUTO_BLOCK_PIN_ACT_INTERCEPT_GB``. Usually near zero; worth setting
             only for a model with a real fixed overhead.
+        workload_fn: ``(pipe, call_kwargs) -> (seq_len, batch) | None``, the
+            architecture's own geometry maths. Called from the managed
+            ``__call__`` wrapper on every generation, *before* the pipeline
+            runs, so the block_pin budget is sized against the job actually
+            being asked for instead of a fallback constant. This is the one
+            budgeting input that depends on the request rather than the model,
+            so it cannot be read off the module tree at ``managed()`` time —
+            see :meth:`ModelManager.set_block_pin_workload`, which this
+            automates. Return ``None`` for anything unrecognised (missing
+            kwargs, an unexpected signature): the caller then keeps the
+            previous budget and the forward-time workload probe still guards
+            the run, so a wrong-shaped call can never be worse than no
+            function at all.
         note: Why this profile says what it says — shown in the resolver log so a
             surprising budget can be traced back to its justification.
     """
@@ -72,6 +92,7 @@ class ModelProfile:
     roles: Mapping[str, str] = field(default_factory=dict)
     act_slope_gb_per_ktoken: float | None = None
     act_intercept_gb: float | None = None
+    workload_fn: Callable[[Any, Mapping[str, Any]], tuple[int, int] | None] | None = None
     note: str = ""
 
     def __post_init__(self) -> None:
@@ -104,6 +125,61 @@ _TRUE_CFG_DUAL_DIT = ModelProfile(
     note="transformer + unconditional_transformer both run every step under True-CFG",
 )
 
+
+def _minimax_h3_workload(pipe: Any, kwargs: Mapping[str, Any]) -> tuple[int, int] | None:
+    """``(seq_len, batch)`` for a MiniMax-H3 request, from its own geometry.
+
+    H3 denoises **one packed sequence** of text + audio + video rows, so the
+    activation cost tracks the row count, not the pixel count. Every constant
+    needed is on the pipeline: the video VAE's ``17``-pixel-frames-to-``5``-latent
+    chunking and its spatial compression, and the transformer's patch. Mirrors
+    ``MiniMaxH3PrepareLatentsStep``: ``sequence_length = num_text_tokens +
+    num_condition_rows + num_audio_rows + num_video_rows``.
+
+    Text and conditioning rows are deliberately **not** counted — the prompt
+    length is not knowable here, and both are small next to the video rows (a
+    few hundred against tens of thousands). Under-counting slightly is safe:
+    the forward-time probe reads the true packed length off the denoiser's own
+    input and raises the reserve if it matters.
+
+    ``batch`` is 1: the released checkpoints are guidance-distilled and denoise a
+    single stream. Were a CFG-batched variant to appear, the probe would observe
+    ``batch=2`` on the first forward and re-budget upward.
+    """
+    height, width, num_frames = kwargs.get("height"), kwargs.get("width"), kwargs.get("num_frames")
+    if not height or not width or not num_frames:
+        return None
+
+    frames_per_chunk = int(getattr(pipe, "vae_frames_per_chunk", 17))
+    latents_per_chunk = int(getattr(pipe, "vae_latents_per_chunk", 5))
+    ratio = int(getattr(pipe, "vae_spatial_compression_ratio", 16))
+    patch = tuple(getattr(pipe, "patch_size", (1, 2, 2)))
+    if frames_per_chunk <= 0 or latents_per_chunk <= 0 or ratio <= 0 or len(patch) != 3:
+        return None
+    _, patch_h, patch_w = (int(p) for p in patch)
+    if patch_h <= 0 or patch_w <= 0:
+        return None
+
+    # Snap up to the next `frames_per_chunk * n + latents_per_chunk` the VAE can
+    # encode, exactly as the pipeline's own `align_num_frames` does.
+    aligned = int(num_frames)
+    while aligned % frames_per_chunk != latents_per_chunk:
+        aligned += 1
+    latent_frames = (aligned - latents_per_chunk) // frames_per_chunk * latents_per_chunk + 2
+
+    rows_per_frame = (int(height) // ratio // patch_h) * (int(width) // ratio // patch_w)
+    video_rows = latent_frames * rows_per_frame
+
+    # Audio rows: one latent per 1/40 s of video, packed channel-major.
+    fps = float(getattr(pipe, "fps", 24.0)) or 24.0
+    channels = int(getattr(pipe, "audio_channels", 2))
+    audio_latents = math.ceil(aligned / fps * _MINIMAX_H3_AUDIO_LATENTS_PER_SECOND)
+    audio_rows = audio_latents * max(1, channels)
+
+    seq_len = video_rows + audio_rows
+    return (seq_len, 1) if seq_len > 0 else None
+
+
 # MiniMax-H3 ships both checkpoint partitions in one repository — ``transformer``
 # for the t2va/fl2va workflows, ``transformer_ref`` for ref2va — but a workflow
 # loads only its own, so they are never co-resident. The role hint covers
@@ -113,6 +189,7 @@ _MINIMAX_H3 = ModelProfile(
     denoiser_concurrency="sequential",
     roles={"transformer_ref": "denoiser"},
     act_slope_gb_per_ktoken=0.158,
+    workload_fn=_minimax_h3_workload,
     note="transformer (t2va/fl2va) and transformer_ref (ref2va) are alternative partitions; a workflow loads one",
 )
 
@@ -193,6 +270,39 @@ def register_model_profile(class_name: str, profile: ModelProfile) -> None:
     if not isinstance(profile, ModelProfile):
         raise TypeError(f"profile must be a ModelProfile, got {type(profile).__name__}")
     MODEL_PROFILES[class_name] = profile
+
+
+def resolve_call_workload(source: Any, kwargs: Mapping[str, Any] | None) -> tuple[int, int] | None:
+    """``(seq_len, batch)`` for this generation, via *source*'s profile, or ``None``.
+
+    The bridge between a pipeline call and the block_pin budget: looks up the
+    architecture's :attr:`ModelProfile.workload_fn` and runs it against the
+    call's own keyword arguments. Returns ``None`` whenever the architecture is
+    unprofiled, has no workload function, or that function declines — in every
+    such case the caller keeps whatever budget it already had.
+
+    Never raises. A profile's geometry maths is third-party-ish code running on
+    the hot path of somebody's generation; a bug in it must degrade to "no
+    estimate", not to a failed run.
+    """
+    profile = get_model_profile(source)
+    if profile is None or profile.workload_fn is None:
+        return None
+    try:
+        result = profile.workload_fn(source, kwargs or {})
+    except Exception as e:
+        logger.debug("workload_fn for %s failed: %s", type(source).__name__, e)
+        return None
+    if result is None:
+        return None
+    try:
+        seq_len, batch = (int(v) for v in result)
+    except (TypeError, ValueError):
+        logger.debug("workload_fn for %s returned %r, expected (seq_len, batch)", type(source).__name__, result)
+        return None
+    if seq_len <= 0 or batch <= 0:
+        return None
+    return seq_len, batch
 
 
 def get_model_profile(source: Any) -> ModelProfile | None:

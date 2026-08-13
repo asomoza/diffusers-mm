@@ -155,6 +155,58 @@ def unpin_blocks(state: BlockPinState, k: int, offload_kwargs: dict[str, Any]) -
     return k
 
 
+def pin_blocks(state: BlockPinState, k: int, device: torch.device) -> int:
+    """Pin the next *k* streamed blocks of *state* — they stop streaming.
+
+    The inverse of :func:`unpin_blocks`: strips the per-block group-offload
+    hooks from blocks ``[n_pinned : n_pinned + k]``, moves them onto *device*,
+    and raises ``state.n_pinned``. Lets the budget grow again when a later
+    generation needs a smaller working set than the one that shrank it —
+    without this, every pin count is a one-way ratchet downward and a small job
+    following a large one keeps paying the streaming cost forever.
+
+    **Not** safe mid-generation, unlike its counterpart: removing hooks walks
+    the blocks' own hook dicts, so call it between calls (the managed
+    ``__call__`` wrapper does, before the pipeline body runs), never from
+    inside a forward hook.
+
+    One caveat worth knowing: re-pinning restores the *speed* (no per-step
+    transfer for those blocks) but not the *host RAM*. Once
+    ``apply_group_offloading`` has run on a block, PyTorch's host caching
+    allocator keeps its pinned staging buffers pooled for the life of the
+    process, and hook removal does not return them — the same asymmetry that
+    made ``apply_block_pin`` skip the pinned blocks entirely rather than
+    hooking-then-unhooking them. Budgeting correctly the first time is
+    therefore still worth more than rebalancing after the fact.
+
+    Returns the number of blocks actually pinned.
+    """
+    from diffusers_mm.hooks import remove_offload_hooks
+
+    blocks = getattr(state.component, state.block_attr, None)
+    if blocks is None:
+        return 0
+    n = state.n_pinned
+    k = max(0, min(k, len(blocks) - n))
+    if k == 0:
+        return 0
+    # An evicted subset lives on the CPU and is brought back wholesale by
+    # ``repin_pinned_subset`` on the component's next forward. Newly-pinned
+    # blocks have to join it *there*, not on the GPU, or the subset would be
+    # split across two devices and the repin would move only part of it.
+    target = device if state.resident else torch.device("cpu")
+    for i in range(n, n + k):
+        remove_offload_hooks(blocks[i])
+        blocks[i].to(target)
+    state.n_pinned = n + k
+    state.device = device
+    # Refresh the cached eviction footprint the auto-evict RAM check reads.
+    per_block = per_block_size_bytes(blocks)
+    non_block = non_block_size_bytes(state.component, state.block_attr)
+    state.pinned_size_bytes = state.n_pinned * per_block + non_block
+    return k
+
+
 def find_largest_block_list(module: nn.Module) -> tuple[str, nn.ModuleList] | None:
     """Return ``(attr_name, module_list)`` for the largest repeated-block list, or ``None``.
 

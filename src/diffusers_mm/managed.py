@@ -34,6 +34,7 @@ def managed(
     block_pin_spill_aware: bool = _UNSET,
     block_pin_spill_margin_gb: float = _UNSET,
     block_pin_workload_probe: bool = _UNSET,
+    block_pin_call_workload: bool = _UNSET,
     auto_no_offload_factor: float = _UNSET,
     auto_model_offload_factor: float = _UNSET,
     auto_ram_headroom: float = _UNSET,
@@ -127,6 +128,15 @@ def managed(
             having to call :meth:`ModelManager.set_block_pin_workload`; the
             apply-time budget otherwise falls back to an image-scale activation
             estimate and over-pins. Only ever lowers the pin count. Default True.
+        block_pin_call_workload: When ``block_pin`` is active and the pipeline's
+            architecture has a profiled ``workload_fn``, compute the denoise
+            workload from each call's own ``height`` / ``width`` / ``num_frames``
+            and rebalance the pin count to match, before the pipeline runs. This
+            is what makes ``set_block_pin_workload`` unnecessary: the budget is
+            exact from the first step rather than corrected after it. Unlike the
+            probe it rebalances in **both** directions, so a small generation
+            following a large one recovers the pins the large one shed. Default
+            True. Unprofiled architectures are unaffected.
         auto_no_offload_factor: Activation margin for the ``no_offload``
             auto tier (``pipeline_weights × this`` must fit in VRAM).
             Default ``1.5``.
@@ -189,6 +199,7 @@ def managed(
         "block_pin_spill_aware": block_pin_spill_aware,
         "block_pin_spill_margin_gb": block_pin_spill_margin_gb,
         "block_pin_workload_probe": block_pin_workload_probe,
+        "block_pin_call_workload": block_pin_call_workload,
         "auto_no_offload_factor": auto_no_offload_factor,
         "auto_model_offload_factor": auto_model_offload_factor,
         "auto_ram_headroom": auto_ram_headroom,
@@ -250,6 +261,13 @@ def managed(
             dev = getattr(self, "_diffusers_mm_device", None)
             if _mm is None or dev is None:
                 return __base_call(self, *args, **kwargs)
+            # Size the block_pin budget from this call's own arguments before
+            # the pipeline allocates anything. Never fatal: a failure here means
+            # the previous budget stands and the forward-time probe still guards.
+            try:
+                _mm._prepare_block_pin_for_call(self, kwargs, dev)
+            except Exception as e:
+                logger.warning("block_pin call-workload preparation failed: %s", e)
             with _mm.device_scope(device=dev, dtype=getattr(self, "_diffusers_mm_dtype", None)):
                 result = __base_call(self, *args, **kwargs)
             _mm._maybe_recalibrate_block_pin_spill(dev)

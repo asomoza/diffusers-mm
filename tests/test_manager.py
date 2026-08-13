@@ -16,7 +16,9 @@ from diffusers_mm.block_pin import (
     find_largest_block_list,
     non_block_size_bytes,
     per_block_size_bytes,
+    pin_blocks,
     repin_pinned_subset,
+    unpin_blocks,
 )
 from diffusers_mm.hooks import find_legacy_weight_norm
 from diffusers_mm.manager import ModelManager, get_device, get_dtype
@@ -25,6 +27,7 @@ from diffusers_mm.model_profiles import (
     ModelProfile,
     get_model_profile,
     register_model_profile,
+    resolve_call_workload,
 )
 from diffusers_mm.offload_defaults import block_pin_activation_scale
 
@@ -3222,3 +3225,298 @@ class TestThreadSafety:
 
         assert not errors
         assert len(mm.component_names) == 4
+
+
+def _h3_geometry_pipe():
+    """An object exposing MiniMaxH3ModularPipeline's geometry surface.
+
+    The profile registry keys on the class *name*, so the stand-in has to carry
+    it. Built in a factory rather than at module level because another test
+    above already defines a differently-shaped fake under that same name.
+    """
+
+    class MiniMaxH3ModularPipeline:
+        vae_frames_per_chunk = 17
+        vae_latents_per_chunk = 5
+        vae_spatial_compression_ratio = 16
+        patch_size = (1, 2, 2)
+        fps = 24.0
+        audio_channels = 2
+
+    return MiniMaxH3ModularPipeline()
+
+
+class TestCallWorkloadGeometry:
+    """``ModelProfile.workload_fn`` must reproduce the real pipeline's packed
+    row count. The expected values are not derived — they are what the actual
+    MiniMax-H3 pipeline printed on measured runs, so this test pins the
+    geometry against ground truth rather than against my own arithmetic."""
+
+    @pytest.mark.parametrize(
+        "height,width,frames,expected",
+        [
+            (480, 832, 124, 14844),  # 0.4 MP, 5s minimum — measured run
+            (768, 1344, 192, 58096),  # measured run
+            (768, 1344, 345, 103966),  # 102,816 video + 1,150 audio rows
+        ],
+    )
+    def test_matches_measured_sequence_lengths(self, height, width, frames, expected):
+        got = resolve_call_workload(_h3_geometry_pipe(), {"height": height, "width": width, "num_frames": frames})
+        assert got == (expected, 1)
+
+    def test_unaligned_frame_count_snaps_up(self):
+        # 120 is not 17n+5; the pipeline snaps to 124, so we must too.
+        at_120 = resolve_call_workload(_h3_geometry_pipe(), {"height": 480, "width": 832, "num_frames": 120})
+        at_124 = resolve_call_workload(_h3_geometry_pipe(), {"height": 480, "width": 832, "num_frames": 124})
+        assert at_120 == at_124
+
+    def test_missing_kwargs_declines(self):
+        assert resolve_call_workload(_h3_geometry_pipe(), {"height": 480}) is None
+        assert resolve_call_workload(_h3_geometry_pipe(), {}) is None
+
+    def test_unprofiled_pipeline_declines(self):
+        class SomeUnknownPipeline:
+            pass
+
+        kwargs = {"height": 480, "width": 832, "num_frames": 124}
+        assert resolve_call_workload(SomeUnknownPipeline(), kwargs) is None
+
+    def test_raising_workload_fn_is_contained(self):
+        def _boom(pipe, kwargs):
+            raise RuntimeError("geometry bug")
+
+        class ExplodingPipeline:
+            pass
+
+        register_model_profile("ExplodingPipeline", ModelProfile(workload_fn=_boom))
+        try:
+            # A bug in a profile's maths must degrade to "no estimate", never
+            # take down someone's generation.
+            assert resolve_call_workload(ExplodingPipeline(), {"height": 1, "width": 1, "num_frames": 1}) is None
+        finally:
+            MODEL_PROFILES.pop("ExplodingPipeline", None)
+
+    def test_malformed_return_declines(self):
+        class BadReturnPipeline:
+            pass
+
+        register_model_profile("BadReturnPipeline", ModelProfile(workload_fn=lambda p, k: ("lots", "of")))
+        try:
+            assert resolve_call_workload(BadReturnPipeline(), {}) is None
+        finally:
+            MODEL_PROFILES.pop("BadReturnPipeline", None)
+
+
+class TestPinBlocksRoundTrip:
+    """``pin_blocks`` is the inverse of ``unpin_blocks`` — the primitive that
+    lets the pin count go back up."""
+
+    def test_unpin_then_pin_restores_count(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        transformer = _FakeTransformer()
+        state = BlockPinState(
+            component=transformer,
+            block_attr="blocks",
+            n_pinned=3,
+            device=torch.device("cpu"),
+            pinned_size_bytes=999,
+        )
+        assert unpin_blocks(state, 2, {}) == 2
+        assert state.n_pinned == 1
+        size_after_unpin = state.pinned_size_bytes
+
+        assert pin_blocks(state, 2, torch.device("cpu")) == 2
+        assert state.n_pinned == 3
+        # The cached eviction footprint tracks the count in both directions.
+        assert state.pinned_size_bytes > size_after_unpin
+
+    def test_pin_blocks_clamps_to_available(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        transformer = _FakeTransformer()
+        state = BlockPinState(component=transformer, block_attr="blocks", n_pinned=1, device=torch.device("cpu"))
+        # Only 2 of the 3 blocks are streamed, so 99 can't be honoured.
+        assert pin_blocks(state, 99, torch.device("cpu")) == 2
+        assert state.n_pinned == 3
+        assert pin_blocks(state, 1, torch.device("cpu")) == 0
+
+
+class TestBlockPinRebalance:
+    """The ratchet has to turn both ways. The forward-time probe and the spill
+    guard only shed blocks; without a path back, one large generation
+    permanently taxes every later small one in the same process."""
+
+    def _mm(self, monkeypatch, *, free_gb):
+        _stub_group_offload(monkeypatch)
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        mm = ModelManager(strategy="block_pin")
+        mm._free_gb = free_gb
+        monkeypatch.setattr(mm, "_effective_free_vram_gb", lambda d: mm._free_gb)
+        return mm
+
+    def _pinned(self, mm, monkeypatch, n_blocks=8, start_pinned=8):
+        """Apply block_pin, then set the starting pin count directly.
+
+        Deliberately not via ``set_block_pin_count``: that marks the component
+        caller-controlled, which is exactly the thing rebalancing must skip. On
+        a CPU device the apply-time budget sees 0 VRAM and pins nothing, so the
+        starting point is established with ``pin_blocks``.
+        """
+
+        class _BigTransformer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.head = nn.Linear(4, 4)
+                self.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(n_blocks)])
+
+            def forward(self, x):
+                return self.head(x)
+
+        transformer = _BigTransformer()
+        mm.register_component("transformer", transformer)
+        mm.apply_offload_strategy("cpu")
+        state = mm._block_pin_states["transformer"]
+        if start_pinned:
+            pin_blocks(state, start_pinned, torch.device("cpu"))
+        return state
+
+    def test_smaller_workload_repins(self, monkeypatch):
+        mm = self._mm(monkeypatch, free_gb=50.0)
+        # A big job has already shed every block.
+        state = self._pinned(mm, monkeypatch, start_pinned=0)
+        assert state.n_pinned == 0
+
+        # Tiny per-block modules mean the budget is dominated by the working
+        # set; a large free reading must let every block back on.
+        mm.set_block_pin_workload(1_000, 1)
+        pinned, unpinned = mm._rebalance_block_pin("cpu", reason="test")
+        assert pinned > 0
+        assert unpinned == 0
+        assert state.n_pinned == 8
+        assert mm._block_pin_counts["transformer"] == 8
+
+    def test_larger_workload_unpins(self, monkeypatch):
+        mm = self._mm(monkeypatch, free_gb=1.0)
+        state = self._pinned(mm, monkeypatch)
+        assert state.n_pinned == 8
+
+        # A workload whose working set exceeds everything free must shed pins.
+        mm.set_block_pin_workload(500_000, 2)
+        pinned, unpinned = mm._rebalance_block_pin("cpu", reason="test")
+        assert unpinned > 0
+        assert pinned == 0
+        assert state.n_pinned < 8
+
+    def test_user_set_count_is_never_rebalanced(self, monkeypatch):
+        mm = self._mm(monkeypatch, free_gb=50.0)
+        _stub_group_offload(monkeypatch)
+        transformer = _FakeTransformer()
+        mm.register_component("transformer", transformer)
+        mm.set_block_pin_count("transformer", 1)
+        mm.apply_offload_strategy("cpu")
+        state = mm._block_pin_states["transformer"]
+        assert state.n_pinned == 1
+
+        mm.set_block_pin_workload(1_000, 1)
+        pinned, unpinned = mm._rebalance_block_pin("cpu", reason="test")
+        # An explicit count is an instruction, not a starting point.
+        assert (pinned, unpinned) == (0, 0)
+        assert state.n_pinned == 1
+
+    def test_small_gain_is_still_taken(self, monkeypatch):
+        """A single block repays its one-off transfer (~8 ms) on the first
+        denoise step, since streaming it costs ~15-27 ms on every step. So the
+        rebalance takes even a small gain rather than leaving it on the table."""
+        mm = self._mm(monkeypatch, free_gb=50.0)
+        state = self._pinned(mm, monkeypatch, start_pinned=7)
+
+        mm.set_block_pin_workload(1_000, 1)
+        pinned, _ = mm._rebalance_block_pin("cpu", reason="test")
+        assert pinned == 1
+        assert state.n_pinned == 8
+
+    def test_already_optimal_does_nothing(self, monkeypatch):
+        mm = self._mm(monkeypatch, free_gb=50.0)
+        state = self._pinned(mm, monkeypatch, start_pinned=8)
+
+        mm.set_block_pin_workload(1_000, 1)
+        assert mm._rebalance_block_pin("cpu", reason="test") == (0, 0)
+        assert state.n_pinned == 8
+
+    def test_no_vram_reading_leaves_counts_alone(self, monkeypatch):
+        mm = self._mm(monkeypatch, free_gb=0.0)
+        state = self._pinned(mm, monkeypatch)
+        before = state.n_pinned
+        assert mm._rebalance_block_pin("cpu", reason="test") == (0, 0)
+        assert state.n_pinned == before
+
+    def test_evicted_subset_is_still_rebalanced(self, monkeypatch):
+        """An evicted subset returns on the next denoiser forward, so its count
+        has to be right *before* then — skipping it would mean a generation
+        following a VAE decode never recovers its pins."""
+        mm = self._mm(monkeypatch, free_gb=50.0)
+        state = self._pinned(mm, monkeypatch, start_pinned=0)
+        state.resident = False
+
+        mm.set_block_pin_workload(1_000, 1)
+        pinned, _ = mm._rebalance_block_pin("cpu", reason="test")
+        assert pinned == 8
+        assert state.n_pinned == 8
+        # Newly-pinned blocks join the evicted subset on the CPU rather than
+        # stranding half of it on the GPU; repin brings the whole set up.
+        assert state.resident is False
+        assert all(p.device.type == "cpu" for p in state.component.blocks.parameters())
+
+
+class TestPrepareBlockPinForCall:
+    """The call-time entry point: profile geometry in, rebalanced budget out."""
+
+    def _mm(self, monkeypatch, *, free_gb=50.0):
+        _stub_group_offload(monkeypatch)
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        mm = ModelManager(strategy="block_pin")
+        monkeypatch.setattr(mm, "_effective_free_vram_gb", lambda d: free_gb)
+        transformer = _FakeTransformer()
+        mm.register_component("transformer", transformer)
+        mm.apply_offload_strategy("cpu")
+        return mm
+
+    def test_records_workload_from_call_kwargs(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+        assert mm._block_pin_seq_len == 0  # nothing recorded yet
+
+        mm._prepare_block_pin_for_call(_h3_geometry_pipe(), {"height": 480, "width": 832, "num_frames": 124}, "cpu")
+        assert (mm._block_pin_seq_len, mm._block_pin_batch) == (14844, 1)
+
+    def test_unprofiled_pipeline_leaves_workload_untouched(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+        mm.set_block_pin_workload(4242, 1)
+
+        class SomethingElsePipeline:
+            pass
+
+        mm._prepare_block_pin_for_call(
+            SomethingElsePipeline(), {"height": 480, "width": 832, "num_frames": 124}, "cpu"
+        )
+        assert mm._block_pin_seq_len == 4242
+
+    def test_opt_out_disables_it(self, monkeypatch):
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin", block_pin_call_workload=False)
+        mm._prepare_block_pin_for_call(_h3_geometry_pipe(), {"height": 480, "width": 832, "num_frames": 124}, "cpu")
+        assert mm._block_pin_seq_len == 0
+
+    def test_inactive_strategy_is_a_no_op(self, monkeypatch):
+        mm = ModelManager(strategy="group_offload")
+        mm._prepare_block_pin_for_call(_h3_geometry_pipe(), {"height": 480, "width": 832, "num_frames": 124}, "cpu")
+        assert mm._block_pin_seq_len == 0
+
+    def test_repeated_identical_call_does_not_rebalance(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+        kwargs = {"height": 480, "width": 832, "num_frames": 124}
+        pipe = _h3_geometry_pipe()
+        mm._prepare_block_pin_for_call(pipe, kwargs, "cpu")
+
+        calls = []
+        monkeypatch.setattr(mm, "_rebalance_block_pin", lambda d, reason: calls.append(reason) or (0, 0))
+        mm._prepare_block_pin_for_call(pipe, kwargs, "cpu")
+        assert calls == []

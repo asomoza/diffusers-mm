@@ -25,12 +25,18 @@ from diffusers_mm.block_pin import (
     find_largest_block_list,
     non_block_size_bytes,
     per_block_size_bytes,
+    pin_blocks,
     repin_pinned_subset,
     unpin_blocks,
 )
 from diffusers_mm.hooks import find_legacy_weight_norm, remove_offload_hooks
 from diffusers_mm.inventory import ComponentInfo, build_inventory
-from diffusers_mm.model_profiles import DENOISER_CONCURRENCY_MODES, ModelProfile, get_model_profile
+from diffusers_mm.model_profiles import (
+    DENOISER_CONCURRENCY_MODES,
+    ModelProfile,
+    get_model_profile,
+    resolve_call_workload,
+)
 from diffusers_mm.modular_compat import ensure_modular_compat
 
 
@@ -173,6 +179,7 @@ class ModelManager:
         block_pin_spill_aware: bool = True,
         block_pin_spill_margin_gb: float = 0.5,
         block_pin_workload_probe: bool = True,
+        block_pin_call_workload: bool = True,
         *,
         auto_no_offload_factor: float | None = None,
         auto_model_offload_factor: float | None = None,
@@ -309,6 +316,12 @@ class ModelManager:
         # to pin on GPU. Names absent from this dict get auto-computed from
         # the available VRAM at apply time.
         self._block_pin_counts: dict[str, int] = {}
+        # Which of those counts the *caller* set via ``set_block_pin_count``,
+        # as opposed to ones the manager calibrated itself. Both live in
+        # ``_block_pin_counts`` (so a later re-apply reproduces either), but
+        # only the manager's own are up for automatic rebalancing — an
+        # explicit count is an instruction, not a starting point.
+        self._block_pin_user_counts: set[str] = set()
         # Expected denoise workload for the workload-aware block_pin working
         # set. ``seq_len = latent_frames × latent_h × latent_w`` and ``batch``
         # is 2 under CFG; ``activation_scale`` (>= 1.0) inflates the base
@@ -375,6 +388,10 @@ class ModelManager:
         self._block_pin_spill_aware: bool = bool(block_pin_spill_aware)
         self._block_pin_spill_margin_gb: float = float(block_pin_spill_margin_gb)
         self._block_pin_workload_probe: bool = bool(block_pin_workload_probe)
+        # Read the denoise workload off each managed ``pipe(...)`` call's own
+        # arguments (via the architecture's ``ModelProfile.workload_fn``) and
+        # rebalance the pin count to match, before the pipeline body runs.
+        self._block_pin_call_workload: bool = bool(block_pin_call_workload)
         self._block_pin_spill_recalibrations: int = 0
 
         # Per-instance overrides for the auto-resolver constants. We
@@ -1562,6 +1579,148 @@ class ModelManager:
             self._effective_free_vram_gb(device),
         )
 
+    # Minimum blocks a rebalance must be able to regain before it bothers
+    # re-pinning. Effectively "any", and deliberately so: re-pinning a block
+    # costs one host-to-device transfer (~8 ms for a 0.38 GiB block on PCIe 5
+    # x16), while leaving it streamed costs ~15-27 ms on *every* denoise step.
+    # A single block therefore repays its transfer on the first step of the
+    # run, and a 30-step generation returns it thirtyfold. Exposed as a knob
+    # for anyone who would rather trade that away for zero churn.
+    _BLOCK_PIN_REPIN_MIN_BLOCKS = 1
+
+    def _rebalance_block_pin(self, device: torch.device | str, *, reason: str) -> tuple[int, int]:
+        """Re-fit every auto-managed component's pin count to the current workload.
+
+        Bidirectional, unlike the forward-time probe and the Windows spill
+        recalibration, which can only ever shed blocks. Those are safety valves
+        firing mid-run, where growing the pinned set would be reckless; this one
+        runs *between* calls, where it is merely a transfer.
+
+        The direction that only this method can supply matters in a long-lived
+        process: a big generation shrinks the pin count to fit its activations,
+        and without a way back every later small generation inherits that count
+        and keeps paying the per-block streaming cost — measured at ~27 ms per
+        block, which is 2% of a 58k-token step but 28% of a 15k-token one. The
+        ratchet has to turn both ways or the first big job silently taxes the
+        rest of the session.
+
+        Budgets against *effective* free VRAM plus what the component's own
+        pinned blocks currently hold — i.e. "if I released everything I pinned,
+        what would fit?" — so it converges to the same answer whether it is
+        growing or shrinking. Components with a caller-set
+        :meth:`set_block_pin_count` are left alone entirely, as are evicted
+        subsets (those belong to the auto-evict path, which will repin them).
+
+        Returns ``(blocks_pinned, blocks_unpinned)``.
+        """
+        if self._applied_strategy != "block_pin":
+            return 0, 0
+        dev = torch.device(device) if isinstance(device, str) else device
+        # No device-type gate: on anything without a VRAM reading
+        # ``_effective_free_vram_gb`` returns 0.0 and every component is skipped
+        # below, which is the same no-op by a shorter route — and keeps the
+        # whole path exercisable on CPU in tests.
+        with self._lock:
+            states = [(n, st) for n, st in self._block_pin_states.items() if n not in self._block_pin_user_counts]
+        if not states:
+            return 0, 0
+
+        working_set_gb = self._resolve_working_set_gb()
+        offload_kwargs = self._group_offload_kwargs(dev)
+        pinned_total = unpinned_total = 0
+
+        for name, st in states:
+            blocks = getattr(st.component, st.block_attr, None)
+            if blocks is None or len(blocks) == 0:
+                continue
+            per_block_gb = per_block_size_bytes(blocks) / (1024**3)
+            if per_block_gb <= 0:
+                continue
+
+            # Re-read free VRAM per component: an earlier component's rebalance
+            # in this same pass has already moved weights on or off the device.
+            free_gb = self._effective_free_vram_gb(dev)
+            if free_gb <= 0:
+                continue  # Detection failed — leave the existing count alone.
+            # How much could be resident during the step: what is free now, plus
+            # what this component's own pinned blocks would give back if
+            # released, less the activations the step needs and the one block
+            # apply_group_offloading keeps prefetched. An evicted subset is
+            # already off the device, so it adds nothing back — but it is about
+            # to return, which is precisely why it still gets rebalanced here.
+            resident_gb = st.n_pinned * per_block_gb if st.resident else 0.0
+            capacity_gb = free_gb + resident_gb - working_set_gb - per_block_gb
+            target = max(0, min(int(capacity_gb / per_block_gb), len(blocks)))
+
+            if target < st.n_pinned:
+                moved = unpin_blocks(st, st.n_pinned - target, offload_kwargs)
+                unpinned_total += moved
+            elif target - st.n_pinned >= self._BLOCK_PIN_REPIN_MIN_BLOCKS:
+                moved = pin_blocks(st, target - st.n_pinned, dev)
+                pinned_total += moved
+            else:
+                continue
+            if moved == 0:
+                continue
+            with self._lock:
+                self._block_pin_counts[name] = st.n_pinned
+            logger.info(
+                "block_pin %s: %s → %d/%d pinned blocks (working set %.2f GiB)",
+                reason,
+                name,
+                st.n_pinned,
+                len(blocks),
+                working_set_gb,
+            )
+
+        if unpinned_total:
+            # Only useful to the workload once the pages are back with the driver.
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return pinned_total, unpinned_total
+
+    def _prepare_block_pin_for_call(self, pipe: Any, kwargs: Any, device: torch.device | str) -> None:
+        """Size the block_pin budget from the call's own arguments, before it runs.
+
+        The workload is the one budgeting input that belongs to the *request*
+        rather than the model, so ``managed()`` cannot know it when it applies
+        the strategy. The architecture's :attr:`ModelProfile.workload_fn` can
+        compute it exactly from the height / width / frame count the caller
+        just passed, which makes an explicit
+        :meth:`set_block_pin_workload` unnecessary for profiled pipelines.
+
+        Runs before the pipeline body, so any resulting change to the pin count
+        is in place for the first denoise step. A no-op when the architecture is
+        unprofiled or the workload is unchanged; the forward-time probe stays
+        installed either way as the backstop for both cases.
+        """
+        if not self._block_pin_call_workload or self._applied_strategy != "block_pin":
+            return
+        workload = resolve_call_workload(pipe, kwargs)
+        if workload is None:
+            return
+        seq_len, batch = workload
+
+        with self._lock:
+            prev = (self._block_pin_seq_len, self._block_pin_batch)
+            scale = self._block_pin_activation_scale
+        if (seq_len, batch) == prev:
+            return  # Already budgeted for exactly this job.
+
+        before_gb = self._resolve_working_set_gb()
+        self.set_block_pin_workload(seq_len, batch, activation_scale=scale)
+        logger.info(
+            "block_pin: workload from call args seq_len=%d batch=%d (was %d/%d) → working set %.2f → %.2f GiB",
+            seq_len,
+            batch,
+            prev[0],
+            prev[1],
+            before_gb,
+            self._resolve_working_set_gb(),
+        )
+        self._rebalance_block_pin(device, reason="call workload")
+
     def _keep_resident_instead_of_offload(self, name: str, mod: Any, device: torch.device | str) -> bool:
         """Move *mod* fully onto *device* instead of group-offloading it, if it must be.
 
@@ -1664,11 +1823,18 @@ class ModelManager:
         an override get an auto-computed value from available VRAM at apply
         time. ``count=0`` is valid — it means "pin nothing for this
         component, just stream it" (effectively per-block ``group_offload``).
+
+        An explicit count also opts the component **out** of per-call
+        rebalancing (see :meth:`_rebalance_block_pin`): the manager will not
+        raise or lower a number the caller chose. The safety valves still
+        apply — a workload that would OOM can still force blocks out — but
+        nothing will quietly grow the count back afterwards.
         """
         if int(count) < 0:
             raise ValueError("block_pin count must be >= 0")
         with self._lock:
             self._block_pin_counts[component_name] = int(count)
+            self._block_pin_user_counts.add(component_name)
 
     def set_evict_on_neighbor(self, component_name: str, value: bool | None) -> None:
         """Override the auto-evict decision for a specific neighbor component.
@@ -2891,6 +3057,7 @@ class ModelManager:
             self._group_offload_low_cpu_mem = True
             self._block_pin_auto_evict = True
             self._block_pin_counts.clear()
+            self._block_pin_user_counts.clear()
             self._evict_on_neighbor.clear()
             self._block_pin_seq_len = 0
             self._block_pin_batch = 1
