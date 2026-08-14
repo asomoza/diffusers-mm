@@ -66,8 +66,8 @@ class ModelProfile:
         act_slope_gb_per_ktoken: Measured denoise activation cost, GiB per 1000
             tokens, overriding ``AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN``. Fill
             from ``demo_scripts/measure_activation_slope.py``; the spread across
-            architectures is wide enough (0.13 to 0.60) that a single default
-            cannot serve them all.
+            architectures is wide enough that a single default cannot serve
+            them all.
         act_intercept_gb: Measured fixed activation cost, overriding
             ``AUTO_BLOCK_PIN_ACT_INTERCEPT_GB``. Usually near zero; worth setting
             only for a model with a real fixed overhead.
@@ -193,32 +193,29 @@ _MINIMAX_H3 = ModelProfile(
     note="transformer (t2va/fl2va) and transformer_ref (ref2va) are alternative partitions; a workflow loads one",
 )
 
-# Measured activation slopes (demo_scripts/measure_activation_slope.py, 2026-08,
-# bf16, RTX 5090). Each is a least-squares fit over four sequence lengths and was
-# linear to within 0.1%.
+# Activation slopes from demo_scripts/measure_activation_slope.py, each a
+# least-squares fit over several sequence lengths. Activations are bf16 whatever
+# the weights are, so these are properties of the architecture.
 _LTX2_3 = ModelProfile(
     act_slope_gb_per_ktoken=0.136,
-    note="measured 0.1364 GiB/ktoken over 4k-94k tokens (intercept ~0)",
+    note="measured over a wide sequence-length range, intercept ~0",
 )
 
 _KREA2 = ModelProfile(
     act_slope_gb_per_ktoken=0.134,
     act_intercept_gb=0.10,
-    note="measured 0.1336 GiB/ktoken over 4k-16k tokens; has a real ~0.1 GiB fixed cost, unlike the others",
+    note="unlike the others, has a real fixed activation cost",
 )
 
 # The outlier that justifies per-model slopes existing at all: Ideogram4 carries
-# per-token LLM features at llm_features_dim=53248 across the *full* packed
-# sequence (the pipeline pads the image positions with zeros rather than slicing),
-# so one input tensor alone is ~104 KiB/token. 4.5x the other three, and it is a
-# co-resident dual DiT on top, so under-budgeting it is doubly expensive.
+# per-token LLM features across the *full* packed sequence (the pipeline pads the
+# image positions with zeros rather than slicing), so one input tensor dominates
+# the forward. Several times the others, and a co-resident dual DiT on top, so
+# under-budgeting it is doubly expensive.
 _IDEOGRAM4 = ModelProfile(
     denoiser_concurrency="co_resident",
     act_slope_gb_per_ktoken=0.603,
-    note=(
-        "transformer + unconditional_transformer both run every step; "
-        "measured 0.6025 GiB/ktoken (llm_features_dim=53248)"
-    ),
+    note="transformer + unconditional_transformer both run every step; per-token llm_features dominate",
 )
 
 

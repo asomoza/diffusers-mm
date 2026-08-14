@@ -5,6 +5,30 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Reserved-pool budgeting for `block_pin`** (`auto_block_pin_allocator_inflation` /
+  `..._windows`, `auto_block_pin_allocator_pool_overhead_gb` / `..._windows_gb`). The pin
+  budget prices the caching allocator's *reserved pool* instead of peak *live* bytes,
+  since the pool is what competes with pinned blocks for driver pages. Two terms: a fixed
+  overhead plus a multiplier on the activation estimate. Neutral off Windows, where
+  `expandable_segments` keeps pool close to live. Scoped to the pin budget — eviction and
+  strategy choice keep live bytes, the former because `_effective_free_vram_gb` already
+  adds the reclaimable pool back in.
+- `block_pin` warns when the working set alone leaves no room, so no pin count can make
+  the workload fit.
+
+### Fixed
+- **Log messages are ASCII-only.** `logging` encodes with the stream's encoding, so a
+  non-ASCII character dropped the whole record on a legacy-code-page console — including
+  every `block_pin` rebalance, workload-probe and spill-recalibration line.
+  `tests/test_log_messages.py` fails on any non-ASCII string reaching a logger, warning
+  or exception.
+- `managed()` was missing the allocator pool-overhead kwargs that `ModelManager` accepts.
+- `test_ctor_arg_affects_resolver_decision` tuned the Linux working-set headroom without
+  pinning `sys.platform`, so it only passed on Linux hosts.
+
 ## [0.4.0] - 2026-08-14
 
 ### Added

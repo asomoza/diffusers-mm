@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import threading
 
 import pytest
@@ -140,11 +141,15 @@ class TestAutoTuningCtorArgs:
         mm2.AUTO_BLOCK_PIN_WORKING_SET_GB = 15.0
         assert mm2.AUTO_BLOCK_PIN_WORKING_SET_GB == 15.0
 
-    def test_ctor_arg_affects_resolver_decision(self):
+    def test_ctor_arg_affects_resolver_decision(self, monkeypatch):
         # End-to-end check: the no_offload gate is additive
         # (weights + working_set <= VRAM), and raising the block_pin
         # working-set headroom inflates that reserve enough to push the
         # resolver past no_offload where the default headroom would fit.
+        # Pinned: the knob under test is the Linux headroom, so a Windows host
+        # would read the other constant and neither assertion would mean anything.
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+
         def make(**kwargs):
             mm = ModelManager(strategy="auto", **kwargs)
             # No components → simple VRAM-tier table; register a tiny one so
@@ -1959,20 +1964,23 @@ class TestBlockPinCount:
         assert n == 2
 
     def test_auto_count_uses_windows_working_set(self, monkeypatch):
-        # Same 12 GB VRAM / 0.5 GB non-block / 1 GB per-block as the Linux
-        # test, but on Windows the headroom is 3.0 GiB → working set =
-        # 4.0 × 1.5 + 3.0 = 9.0 GiB → budget = 12 - 0.5 - 9.0 - 1 = 1.5 GB
-        # → 1 block fits (fewer than Linux). The OS split: don't make Linux
-        # pay for Windows' allocator overhead.
-        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
-        _patch_vram(monkeypatch, 12.0)
-        mm = ModelManager()
-        monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(1.0 * 1024**3))
-        monkeypatch.setattr("diffusers_mm.manager.non_block_size_bytes", lambda c, a: int(0.5 * 1024**3))
-        m = nn.Module()
-        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(20)])
-        n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
-        assert n == 1
+        # Windows carries a higher headroom plus the reserved-pool correction, so
+        # it pins fewer blocks than Linux from the same inputs. Sized so both land
+        # above zero and the arithmetic is under test rather than the clamp.
+        #   win32: 4.0 × 1.5 × 1.25 + 3.0 + 3.0 = 13.5 → 24 - 0.5 - 13.5 - 1 → 9
+        #   linux: 4.0 × 1.5              + 2.0 =  8.0 → 24 - 0.5 -  8.0 - 1 → 14
+        def count_on(platform):
+            monkeypatch.setattr("diffusers_mm.manager.sys.platform", platform)
+            _patch_vram(monkeypatch, 24.0)
+            mm = ModelManager()
+            monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(1.0 * 1024**3))
+            monkeypatch.setattr("diffusers_mm.manager.non_block_size_bytes", lambda c, a: int(0.5 * 1024**3))
+            m = nn.Module()
+            m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(20)])
+            return mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
+
+        assert count_on("win32") == 9
+        assert count_on("linux") == 14
 
     def test_auto_count_shrinks_as_workload_grows(self, monkeypatch):
         # The workload-aware working set: a larger recorded denoise seq_len
@@ -2034,8 +2042,97 @@ class TestWorkloadAwareWorkingSet:
     def test_windows_headroom_higher(self, monkeypatch):
         monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
         mm = ModelManager()
-        # 4.0 × 1.5 + 3.0 = 9.0
+        # 4.0 × 1.5 + 3.0 = 9.0. Live bytes — no allocator inflation here.
         assert mm._resolve_working_set_gb() == pytest.approx(9.0)
+
+
+class TestAllocatorInflation:
+    """The pin budget prices the allocator's reserved pool, not live bytes."""
+
+    def test_pin_budget_inflated_on_windows_only(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        mm = ModelManager()
+        # activation 4.0 × 1.5 = 6.0 → × 1.25 = 7.5, + 3.0 pool + 3.0 headroom
+        assert mm._resolve_pin_budget_working_set_gb() == pytest.approx(13.5)
+        assert mm._resolve_pin_budget_working_set_gb() > mm._resolve_working_set_gb()
+
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        mm = ModelManager()
+        assert mm._resolve_pin_budget_working_set_gb() == pytest.approx(mm._resolve_working_set_gb())
+
+    def test_eviction_threshold_is_not_inflated(self, monkeypatch):
+        """Eviction compares against ``_effective_free_vram_gb``, which already adds
+        the reclaimable pool back — correcting this side too would double-count it
+        and thrash the pinned blocks on a warmed-up allocator."""
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        mm = ModelManager()
+        mm.set_block_pin_workload(37_735, batch=1)
+        assert mm._resolve_working_set_gb() < mm._resolve_pin_budget_working_set_gb()
+
+    def test_inflation_is_configurable(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        # Zeroing both terms restores the uncorrected budget.
+        mm = ModelManager(
+            auto_block_pin_allocator_inflation_windows=1.0,
+            auto_block_pin_allocator_pool_overhead_windows_gb=0.0,
+        )
+        assert mm._resolve_pin_budget_working_set_gb() == pytest.approx(mm._resolve_working_set_gb())
+        mm = ModelManager(
+            auto_block_pin_allocator_inflation_windows=2.0,
+            auto_block_pin_allocator_pool_overhead_windows_gb=5.0,
+        )
+        assert mm._resolve_pin_budget_working_set_gb() == pytest.approx(6.0 * 2.0 + 5.0 + 3.0)
+
+    def test_warns_when_no_pin_count_can_fit(self, monkeypatch, caplog):
+        """A working set that leaves no room must say so, once."""
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        _patch_vram(monkeypatch, 14.6)
+        mm = ModelManager()
+        mm.set_block_pin_workload(37_710, batch=1)
+        monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(0.33 * 1024**3))
+        monkeypatch.setattr("diffusers_mm.manager.non_block_size_bytes", lambda c, a: int(0.64 * 1024**3))
+        m = nn.Module()
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(50)])
+
+        with caplog.at_level(logging.WARNING, logger="diffusers_mm.manager"):
+            n = mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
+            # Re-budgeting the same workload must not repeat the warning.
+            mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
+
+        assert n == 0
+        fit_warnings = [r for r in caplog.records if "does not fit" in r.getMessage()]
+        assert len(fit_warnings) == 1
+        assert "seq_len=37710" in fit_warnings[0].getMessage()
+        assert "shared memory" in fit_warnings[0].getMessage()
+
+    def test_warning_names_the_platform_consequence(self, monkeypatch, caplog):
+        """The warning is not platform-gated, so its text has to match the platform."""
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        _patch_vram(monkeypatch, 8.0)
+        mm = ModelManager()
+        mm.set_block_pin_workload(37_710, batch=1)
+        monkeypatch.setattr("diffusers_mm.manager.per_block_size_bytes", lambda b: int(0.33 * 1024**3))
+        monkeypatch.setattr("diffusers_mm.manager.non_block_size_bytes", lambda c, a: int(0.64 * 1024**3))
+        m = nn.Module()
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(50)])
+
+        with caplog.at_level(logging.WARNING, logger="diffusers_mm.manager"):
+            assert mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda") == 0
+
+        msg = next(r.getMessage() for r in caplog.records if "does not fit" in r.getMessage())
+        assert "out-of-memory" in msg
+        assert "shared memory" not in msg
+
+    def test_scales_with_recorded_workload(self, monkeypatch):
+        """The multiplier rides the activation term, so the budget grows with the job."""
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        mm = ModelManager()
+        small = mm._resolve_pin_budget_working_set_gb()
+        mm.set_block_pin_workload(37_735, batch=1)
+        large = mm._resolve_pin_budget_working_set_gb()
+        assert large > small
+        # 0.30 + 0.16 × 37.735 = 6.338; × 1.5 safety × 1.25 inflation + 3.0 pool + 3.0 headroom
+        assert large == pytest.approx((0.30 + 0.16 * 37.735) * 1.5 * 1.25 + 3.0 + 3.0)
 
     def test_linear_fit_scales_with_seq_len(self, monkeypatch):
         monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")

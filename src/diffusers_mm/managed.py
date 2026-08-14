@@ -49,6 +49,10 @@ def managed(
     auto_block_pin_act_safety_factor: float = _UNSET,
     auto_block_pin_act_safety_factor_measured: float = _UNSET,
     auto_block_pin_act_fallback_gb: float = _UNSET,
+    auto_block_pin_allocator_inflation: float = _UNSET,
+    auto_block_pin_allocator_inflation_windows: float = _UNSET,
+    auto_block_pin_allocator_pool_overhead_gb: float = _UNSET,
+    auto_block_pin_allocator_pool_overhead_windows_gb: float = _UNSET,
 ) -> Any:
     """Wrap a diffusers pipeline with smart model management.
 
@@ -89,15 +93,15 @@ def managed(
             transfers — overlaps transfers with compute (~1.5–3× faster
             on hardware that supports it). Default True.
         group_offload_low_cpu_mem: Low CPU memory mode for group offload —
-            avoids pinning a full copy of every weight upfront (which
-            would ~double host RAM). Only honored when ``use_stream=True``.
+            avoids pinning a full copy of every weight upfront, which would
+            roughly double host RAM. Only honored when ``use_stream=True``.
             Default True.
         block_pin_auto_evict: For the ``block_pin`` strategy, evict the
             pinned subset to CPU when a neighbor component (text encoder,
             VAE, etc.) runs, then repin on demand when the pinned
-            component's next forward fires. Frees several GiB of VRAM
+            component's next forward fires. Frees the pinned subset's VRAM
             during VAE decode at the cost of two extra CPU↔GPU transfers
-            per inference (typically 1–2 s on PCIe 4). Default True.
+            per inference. Default True.
         denoiser_concurrency: How to budget pipelines with multiple denoisers
             (DiTs). ``"co_resident"`` sums their sizes — correct when both run
             every step (e.g. Ideogram4 conditional + unconditional under
@@ -143,8 +147,8 @@ def managed(
             they are dead weight for the rest of the generation. Frees their
             weights *and* the pinned host copy group offload holds for them,
             which on a text-encoder-dominated pipeline is the largest single
-            block of reclaimable memory (MiniMax-H3: 32.6 GiB of 57.2). Covers
-            multi-encoder pipelines (SDXL, SD3) by role, not by name.
+            block of reclaimable memory. Covers multi-encoder pipelines
+            (SDXL, SD3) by role, not by name.
 
             Destructive and therefore opt-in: the pipeline's own attribute is
             cleared, since that reference is what keeps the weights alive. A
@@ -154,45 +158,47 @@ def managed(
             generations pays a full reload each time. Default False.
         auto_no_offload_factor: Activation margin for the ``no_offload``
             auto tier (``pipeline_weights × this`` must fit in VRAM).
-            Default ``1.5``.
         auto_model_offload_factor: Activation margin for the
             ``model_offload`` auto tier (``largest_component × this``
-            must fit in VRAM). Default ``1.5``.
+            must fit in VRAM).
         auto_ram_headroom: Fraction of RAM treated as "usable" before
-            logging a 'workload won't fit' warning. Default ``0.85``.
+            logging a 'workload won't fit' warning.
         auto_low_cpu_mem_ram_headroom_gb: RAM headroom (GiB) required to
             flip ``group_offload``'s ``low_cpu_mem_usage=False`` when
-            ``auto`` picks it. Default ``16.0``.
+            ``auto`` picks it.
         auto_block_pin_working_set_gb: Platform safety headroom (GiB)
             added on top of the workload-aware activation estimate for
-            the ``block_pin`` working set, on Linux/macOS. Default
-            ``2.0``. (The bulk of the reserve now scales with the recorded
-            workload — see ``ModelManager.set_block_pin_workload``.)
-        auto_block_pin_working_set_windows_gb: Same as above on Windows
-            (no ``expandable_segments``, larger allocator overhead).
-            Default ``3.0``.
+            the ``block_pin`` working set. Only the headroom — the bulk of
+            the reserve scales with the recorded workload, see
+            ``ModelManager.set_block_pin_workload``.
+        auto_block_pin_working_set_windows_gb: The same on Windows, which
+            has no ``expandable_segments`` and larger allocator overhead.
         auto_block_pin_min_blocks: Minimum block count required before
             ``auto`` will pick ``block_pin`` over ``group_offload``.
-            Default ``8``.
         auto_block_pin_ram_evict_headroom_gb: RAM safety margin (GiB)
-            for the ``block_pin`` auto-evict RAM-absorb check. Default
-            ``4.0``.
+            for the ``block_pin`` auto-evict RAM-absorb check.
         auto_block_pin_act_intercept_gb: Intercept (GiB) of the
-            workload-aware activation fit. Default ``0.30``.
+            workload-aware activation fit.
         auto_block_pin_act_slope_gb_per_ktoken: Slope (GiB per 1000
-            ``batch × seq_len`` tokens) of the activation fit. Default
-            ``0.118``.
+            ``batch × seq_len`` tokens) of that fit.
         auto_block_pin_act_safety_factor: Multiplier on the activation
-            estimate before adding the platform headroom, used when the slope is
-            the generic default. Default ``1.5`` — most of which is cushion for
-            not knowing the architecture's real activation cost.
+            estimate before the platform headroom is added, used when the
+            slope is the generic default — most of it is cushion for not
+            knowing the architecture's real activation cost.
         auto_block_pin_act_safety_factor_measured: The same multiplier, used
-            instead when the slope came from a measured
-            :class:`~diffusers_mm.model_profiles.ModelProfile`. Default ``1.2``:
-            a measurement needs far less cushion, and keeping ``1.5`` on top of
-            one over-reserves enough to pin no blocks at all on a long video.
+            instead when the slope came from a
+            :class:`~diffusers_mm.model_profiles.ModelProfile`, which needs
+            far less cushion.
         auto_block_pin_act_fallback_gb: Activation estimate (GiB) used
-            when no workload has been recorded. Default ``4.0``.
+            when no workload has been recorded.
+        auto_block_pin_allocator_inflation: Multiplier turning the
+            sequence-length part of the activation estimate into a
+            reserved-pool figure for the pin budget. Neutral off Windows.
+        auto_block_pin_allocator_inflation_windows: The same, on Windows.
+        auto_block_pin_allocator_pool_overhead_gb: Fixed pool overhead (GiB)
+            added to the pin budget. Neutral off Windows.
+        auto_block_pin_allocator_pool_overhead_windows_gb: The same, on
+            Windows.
 
     Returns:
         The same pipeline object, augmented with a ``.mm`` attribute and
@@ -229,6 +235,10 @@ def managed(
         "auto_block_pin_act_safety_factor": auto_block_pin_act_safety_factor,
         "auto_block_pin_act_safety_factor_measured": auto_block_pin_act_safety_factor_measured,
         "auto_block_pin_act_fallback_gb": auto_block_pin_act_fallback_gb,
+        "auto_block_pin_allocator_inflation": auto_block_pin_allocator_inflation,
+        "auto_block_pin_allocator_inflation_windows": auto_block_pin_allocator_inflation_windows,
+        "auto_block_pin_allocator_pool_overhead_gb": auto_block_pin_allocator_pool_overhead_gb,
+        "auto_block_pin_allocator_pool_overhead_windows_gb": auto_block_pin_allocator_pool_overhead_windows_gb,
     }
     explicit = {k: v for k, v in config_kwargs.items() if v is not _UNSET}
 
@@ -242,7 +252,7 @@ def managed(
         # the mismatch instead of silently dropping intent.
         logger.warning(
             "managed(): an existing ModelManager was supplied along with "
-            "configuration kwargs %s. These are ignored — the manager's "
+            "configuration kwargs %s. These are ignored - the manager's "
             "existing configuration is used. Configure the manager directly "
             "if you want to change them.",
             explicit,

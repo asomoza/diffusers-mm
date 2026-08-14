@@ -1,6 +1,6 @@
 """Selective transformer-block pinning — internals for the ``block_pin`` strategy.
 
-Pattern (validated empirically on LTX-2.3, see demo_scripts/test_demo_ltx23_block_pin.py):
+The pattern:
 
 1. Find the largest ``nn.ModuleList`` of repeated same-type children — this is
    the "block list" (e.g. ``transformer_blocks``).

@@ -97,6 +97,20 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 Without it, allocator fragmentation can eat ~1-2 GiB and a careful budget can OOM. The strategy logs a warning if it's missing on apply.
 
+**Windows: the reserved pool, not the live bytes.** `expandable_segments` is inert on Windows — torch parses the flag, warns `expandable_segments not supported on this platform`, and ignores it, because the CUDA virtual-memory API it needs isn't exposed by the Windows driver. The allocator therefore accumulates fixed segments, and its *reserved pool* settles above the peak *live* bytes a forward holds: partly by a fixed amount (streamed block weights it holds without reusing), partly in proportion to the activations. The pool is what competes with pinned blocks for driver pages, so on Windows the pin budget corrects for both before subtracting:
+
+```python
+pipe = managed(
+    pipe,
+    auto_block_pin_allocator_inflation_windows=1.25,        # multiplier on the seq_len term
+    auto_block_pin_allocator_pool_overhead_windows_gb=3.0,  # fixed, on top of the headroom
+)
+```
+
+Set both to `1.0` / `0.0` to opt out. To calibrate for your own setup, log `torch.cuda.max_memory_reserved()` against `max_memory_allocated()` after one denoise step at two different sequence lengths and fit the line. The defaults come from one video DiT on one card and the fixed term follows your block count and per-block size rather than the model, so treat them as a starting point and measure — reserved also grows in segment-sized steps rather than smoothly.
+
+If the working set alone exceeds available VRAM, no pin count can help — streaming every block still spills — and `block_pin` says so explicitly rather than leaving you with a run that is quietly several times slower. The fix there is a smaller job: the working set scales with the denoise sequence length, so fewer frames or a smaller canvas is what moves it.
+
 ### Tuning the auto resolver
 
 Every threshold the `"auto"` strategy uses internally is also a constructor argument on `ModelManager` (and a `managed()` kwarg). The defaults are tuned for image diffusion on consumer hardware — bump them for unusual workloads (high-activation video, very RAM-tight machines, etc.). All are keyword-only:
@@ -125,6 +139,12 @@ pipe = managed(
     auto_block_pin_act_slope_gb_per_ktoken=0.118, # +GiB per 1000 (batch × seq_len) tokens
     auto_block_pin_act_safety_factor=1.5,         # multiplier before adding headroom
     auto_block_pin_act_fallback_gb=4.0,           # estimate used when no workload recorded
+
+    # --- allocator reserved-pool model (pin budget only) ---
+    auto_block_pin_allocator_inflation=1.0,             # multiplier on the seq_len term
+    auto_block_pin_allocator_inflation_windows=1.25,    # same, Windows (no expandable_segments)
+    auto_block_pin_allocator_pool_overhead_gb=0.0,      # fixed pool overhead
+    auto_block_pin_allocator_pool_overhead_windows_gb=3.0,
 )
 ```
 
@@ -142,6 +162,10 @@ Each knob in detail:
 | `auto_block_pin_ram_evict_headroom_gb` | 4.0 | Neighbors have unusually large host-side staging (large pinned buffers, big activations). | Neighbors are lightweight and you want eviction to fire more readily. |
 | `auto_block_pin_act_slope_gb_per_ktoken` | 0.118 | Your pipeline's activations grow faster with sequence length than the measured video-DiT fit. | Activations are flatter (e.g. heavily windowed attention). |
 | `auto_block_pin_act_fallback_gb` | 4.0 | You can't call `set_block_pin_workload` and your typical job has large activations. | Typical job is small and you want more blocks pinned by default. |
+| `auto_block_pin_allocator_inflation` | 1.0 | `max_memory_reserved()` grows faster than `max_memory_allocated()` as you raise the sequence length. | You verified the pool tracks live bytes closely. |
+| `auto_block_pin_allocator_inflation_windows` | 1.25 | Your measured slope ratio is steeper. | Shallower. Set to `1.0` with the overhead at `0.0` to opt out entirely. |
+| `auto_block_pin_allocator_pool_overhead_gb` | 0.0 | `reserved - allocated` has a floor independent of sequence length. | It doesn't. |
+| `auto_block_pin_allocator_pool_overhead_windows_gb` | 3.0 | More or larger streamed blocks than the default was calibrated on. | Fewer or smaller streamed blocks, or the whole denoiser is pinned. |
 
 These can also be set after construction by assigning the matching ALL_CAPS attribute on the manager — e.g. `pipe.mm.AUTO_BLOCK_PIN_WORKING_SET_GB = 12.0`. The ctor arg is shorthand for "do that at construction time."
 

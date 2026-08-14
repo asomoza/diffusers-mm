@@ -85,11 +85,9 @@ class ModelManager:
     context vars, and automatic offload strategy resolution/application.
     """
 
-    # Heuristic factors used by the ``auto`` strategy resolver. The
-    # rationale: weights occupy GPU memory steadily; activations come and
-    # go on top. 1.5× is a reasonable middle-ground for typical diffusion
-    # pipelines (SDXL, Flux, Wan-class). Tweak via subclass / attribute set
-    # if your workload has unusually large or small activation footprint.
+    # Heuristic factors used by the ``auto`` strategy resolver: weights occupy
+    # GPU memory steadily, activations come and go on top. Tweak via subclass /
+    # attribute set for an unusually large or small activation footprint.
     AUTO_NO_OFFLOAD_FACTOR = 1.5  # DEPRECATED: superseded by the additive
     # ``weights + working_set`` no_offload gate (see resolve_offload_strategy).
     # Retained so existing ctor/attribute usage keeps working; no longer read
@@ -98,75 +96,49 @@ class ModelManager:
     # If pipeline weights exceed RAM × this, log a loud warning that the
     # workload likely won't fit on host memory at all.
     AUTO_RAM_HEADROOM = 0.85
-    # When ``auto`` picks ``group_offload``, decide whether to flip
-    # ``low_cpu_mem_usage`` off. With ``low_cpu_mem_usage=False``
-    # diffusers pre-pins a full copy of every weight at apply time for
-    # faster transfers (pinning happens once, not per-transfer). With
-    # ``True``, pinning is per-transfer — slower steady-state but lower
-    # peak host RAM.
-    #
-    # The flip condition is "RAM ≥ pipeline_weights + headroom". The
-    # headroom covers OS + pipeline activations + transient buffers; we
-    # don't budget for the original weights because modern safetensors
-    # is mmap'd (originals may or may not be resident, and pages get
-    # evicted as needed). Default 16 GB is comfortable for most setups.
+    # When ``auto`` picks ``group_offload``, whether to flip
+    # ``low_cpu_mem_usage`` off: ``False`` pre-pins a full host copy of every
+    # weight once at apply time (faster transfers, higher peak host RAM),
+    # ``True`` pins per-transfer. Flips when ``RAM >= weights + headroom``; the
+    # headroom covers OS, activations and transient buffers, but not the original
+    # weights, since safetensors is mmap'd and those pages get evicted as needed.
     AUTO_LOW_CPU_MEM_RAM_HEADROOM_GB = 16.0
-    # Block-pin auto-budget: the VRAM reserved per component for the
-    # streaming overflow's working set (pinned host buffers in flight +
-    # denoise activations + per-step peaks). This is **workload-aware** —
-    # see :meth:`_resolve_working_set_gb`. The reserve is
-    #   ``activation_estimate(seq_len, batch) × SAFETY_FACTOR + headroom``
-    # where the activation estimate is a linear fit in the denoise
-    # sequence length (recorded via :meth:`set_block_pin_workload`), so it
-    # scales with video size / length instead of a flat constant. When no
-    # workload is recorded it falls back to ``ACT_FALLBACK_GB``.
-    #
-    # The two ``WORKING_SET`` constants below are now the **platform
-    # safety headroom added on top of** that activation estimate (allocator
-    # fragmentation, the group-offload stream double-buffer, modest
-    # attention overhead) — NOT the whole working set as in older releases.
-    # Windows is higher because ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``
-    # is Linux-only (relies on the CUDA virtual memory management API not
-    # exposed on the Windows driver), so the Windows allocator runs in
-    # fixed-segment mode and reserves more under the same load. Override
-    # either on the instance/subclass (or via ctor arg) for unusual
-    # allocator behaviour.
+    # Platform safety headroom added *on top of* the workload-aware activation
+    # estimate — allocator fragmentation, the group-offload stream double-buffer,
+    # attention overhead — not the whole working set as in releases <= 0.2.x. See
+    # :meth:`_resolve_working_set_gb`. Higher on Windows, which has no
+    # ``expandable_segments`` and so reserves more under the same load.
     AUTO_BLOCK_PIN_WORKING_SET_GB = offload_defaults.BLOCK_PIN_WORKING_SET_HEADROOM_GB
     AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB = offload_defaults.BLOCK_PIN_WORKING_SET_HEADROOM_WINDOWS_GB
-    # Workload-aware activation fit (GB), measured on LTX-2.3 distilled; the
-    # denoise working set is bf16 regardless of weight quantization so it
-    # generalises. ``intercept + slope × ktokens`` where
-    # ``ktokens = batch × seq_len / 1000``. The safety factor lifts the bare
-    # fit to a safe ceiling (cross-model variance + neighbor-onload
-    # transients); the fallback is used when the workload is unknown.
+    # Activation fit ``intercept + slope × ktokens``, where
+    # ``ktokens = batch × seq_len / 1000`` from :meth:`set_block_pin_workload`,
+    # so the reserve scales with video size / length instead of being flat. The
+    # safety factor lifts the bare fit to a safe ceiling; the fallback covers an
+    # unknown workload.
     AUTO_BLOCK_PIN_ACT_INTERCEPT_GB = offload_defaults.BLOCK_PIN_ACT_INTERCEPT_GB
     AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN = offload_defaults.BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN
     AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR = offload_defaults.BLOCK_PIN_ACT_SAFETY_FACTOR
     AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR_MEASURED = offload_defaults.BLOCK_PIN_ACT_SAFETY_FACTOR_MEASURED
     AUTO_BLOCK_PIN_ACT_FALLBACK_GB = offload_defaults.BLOCK_PIN_ACT_FALLBACK_GB
+    # Turns the activation estimate (peak *live* bytes) into the caching
+    # allocator's peak *reserved* pool, which is what competes with pinned
+    # weights for driver pages: a multiplier on the sequence-length term plus a
+    # fixed overhead. Both neutral off Windows — see
+    # ``offload_defaults.BLOCK_PIN_ALLOCATOR_INFLATION``.
+    AUTO_BLOCK_PIN_ALLOCATOR_INFLATION = offload_defaults.BLOCK_PIN_ALLOCATOR_INFLATION
+    AUTO_BLOCK_PIN_ALLOCATOR_INFLATION_WINDOWS = offload_defaults.BLOCK_PIN_ALLOCATOR_INFLATION_WINDOWS
+    AUTO_BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_GB = offload_defaults.BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_GB
+    AUTO_BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_WINDOWS_GB = offload_defaults.BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_WINDOWS_GB
     # Don't bother with block_pin if the discoverable block list is
     # smaller than this — the overhead of per-block apply_group_offloading
     # outweighs the benefit when there are only a handful of blocks.
     AUTO_BLOCK_PIN_MIN_BLOCKS = 8
-    # Safety headroom for the auto-evict RAM check. When the pre-forward
-    # hook decides "free VRAM is below the working-set margin, I should
-    # evict the pinned subset", we also check that the host can absorb
-    # the evicted weights without itself OOMing. The check is:
-    #
-    #   ram_available_gb >= evicted_subset_gb + RAM_EVICT_HEADROOM_GB
-    #
-    # The headroom covers the about-to-run neighbor's own ``pin_memory``
-    # allocations for streaming + activations + OS slack. Default 4 GiB
-    # is comfortable for image/video diffusion neighbors; bump it if your
-    # neighbors have unusually large host-side staging needs.
-    #
-    # Real-world trigger: a Windows user with 24 GiB VRAM and 32 GiB RAM
-    # hit ``pin_memory()`` OOM on the connectors forward after auto-evict
-    # pushed ~12 GiB of int8 transformer blocks from VRAM to a host that
-    # had 1.8 GiB free. The eviction "succeeded" (via swap) but starved
-    # the next ``cudaHostAlloc`` call. With this check, the eviction is
-    # refused, the pinned subset stays on GPU, and the neighbor is left
-    # to fit in whatever VRAM is free — not great, but not strictly worse.
+    # Safety headroom for the auto-evict RAM check: eviction fires only when
+    # ``ram_available >= evicted_subset + this``, so pushing pinned blocks back
+    # to the host cannot itself OOM. Without it an eviction can "succeed" via
+    # swap and then starve the next ``cudaHostAlloc``; refusing it instead leaves
+    # the neighbor to fit in whatever VRAM is free, which is not worse. The
+    # headroom covers the neighbor's own ``pin_memory`` staging and OS slack.
     AUTO_BLOCK_PIN_RAM_EVICT_HEADROOM_GB = 4.0
 
     def __init__(
@@ -195,6 +167,10 @@ class ModelManager:
         auto_block_pin_act_safety_factor: float | None = None,
         auto_block_pin_act_safety_factor_measured: float | None = None,
         auto_block_pin_act_fallback_gb: float | None = None,
+        auto_block_pin_allocator_inflation: float | None = None,
+        auto_block_pin_allocator_inflation_windows: float | None = None,
+        auto_block_pin_allocator_pool_overhead_gb: float | None = None,
+        auto_block_pin_allocator_pool_overhead_windows_gb: float | None = None,
     ) -> None:
         """Construct a manager.
 
@@ -212,8 +188,7 @@ class ModelManager:
                 bypass the resolver. One of ``"auto"``, ``"no_offload"``,
                 ``"model_offload"``, ``"group_offload"``, ``"block_pin"``.
             group_offload_use_stream: Use CUDA streams for group offload
-                transfers. Overlaps CPU↔GPU copies with compute, typically
-                1.5–3× faster on hardware that supports it.
+                transfers, overlapping CPU↔GPU copies with compute.
             group_offload_low_cpu_mem: Defer pinned-host-buffer allocation
                 per transfer instead of pre-pinning a full copy of every
                 streamed weight. Lower host RAM, slightly slower
@@ -221,62 +196,63 @@ class ModelManager:
             block_pin_auto_evict: When the ``block_pin`` strategy is
                 active, evict the pinned subset back to CPU before a
                 neighbor (text encoder, VAE, ...) runs, then repin on
-                demand. Frees several GiB of VRAM during VAE decode at
-                the cost of two extra CPU↔GPU transfers per inference.
+                demand. Frees VRAM during VAE decode at the cost of two
+                extra CPU↔GPU transfers per inference.
             auto_no_offload_factor: Activation margin for the
-                ``no_offload`` tier. ``pipeline_weights × this`` must fit
-                in available VRAM. Default ``1.5`` (≈0.3 GiB headroom
-                above empirical peak for SDXL/Flux/Wan-class image
-                pipelines). Raise if your workload has unusually large
-                activations relative to weights.
-            auto_model_offload_factor: Activation margin for the
-                ``model_offload`` tier. ``largest_component × this`` must
-                fit in available VRAM. Same default and rationale as
-                ``auto_no_offload_factor``.
+                ``no_offload`` tier — ``pipeline_weights × this`` must fit
+                in available VRAM. Raise when activations are large
+                relative to weights.
+            auto_model_offload_factor: The same for the ``model_offload``
+                tier, against the largest component.
             auto_ram_headroom: Fraction of RAM the resolver considers
                 "usable" before logging a 'workload won't fit on host'
-                warning. Default ``0.85`` (15% safety margin for OS +
-                activations + transient buffers).
+                warning.
             auto_low_cpu_mem_ram_headroom_gb: When ``auto`` picks
                 ``group_offload``, flip ``low_cpu_mem_usage`` to ``False``
                 (faster transfers, higher host RAM) if
-                ``RAM ≥ pipeline_weights + this``. Default ``16.0`` GiB.
-                Lower the headroom on RAM-rich systems to bias toward
-                speed; raise it on tight systems to stay in low-RAM mode.
+                ``RAM ≥ pipeline_weights + this``. Lower it on RAM-rich
+                systems to bias toward speed, raise it to stay in low-RAM
+                mode.
             auto_block_pin_working_set_gb: Platform safety headroom (GiB)
                 added on top of the workload-aware activation estimate for
-                the ``block_pin`` working set. Default ``2.0`` GiB. (In
-                releases ≤ 0.2.x this was the *entire* working-set margin
-                at ``6.5``; it is now just the headroom — the bulk of the
-                reserve now scales with the recorded workload, see
-                :meth:`set_block_pin_workload`.)
-            auto_block_pin_working_set_windows_gb: Same as above, on
-                Windows. Default ``3.0`` GiB — higher because the Windows
-                allocator runs in fixed-segment mode (no
-                ``expandable_segments`` support) and reserves more under
-                the same load.
-            auto_block_pin_min_blocks: Minimum block count required for
-                ``auto`` to pick ``block_pin`` over plain
-                ``group_offload``. Default ``8`` — below this, per-block
-                ``apply_group_offloading`` overhead outweighs the benefit
-                of pinning.
+                the ``block_pin`` working set. Only the headroom — the bulk
+                of the reserve scales with the recorded workload, see
+                :meth:`set_block_pin_workload`.
+            auto_block_pin_working_set_windows_gb: The same, on Windows,
+                whose allocator reserves more under the same load.
+            auto_block_pin_min_blocks: Minimum block count for ``auto`` to
+                pick ``block_pin`` over plain ``group_offload``; below it
+                per-block hook overhead outweighs pinning.
             auto_block_pin_ram_evict_headroom_gb: Safety margin for the
                 ``block_pin`` auto-evict RAM-absorb check. Eviction fires
-                only when ``ram_available ≥ evicted_subset + this``.
-                Default ``4.0`` GiB. Raise on systems where neighbors
-                have unusually large host-side staging needs.
+                only when ``ram_available ≥ evicted_subset + this``. Raise
+                it for neighbors with large host-side staging needs.
             auto_block_pin_act_intercept_gb: Intercept (GiB) of the
-                workload-aware activation fit. Default ``0.30``.
+                workload-aware activation fit.
             auto_block_pin_act_slope_gb_per_ktoken: Slope (GiB per 1000
-                ``batch × seq_len`` tokens) of the activation fit.
-                Default ``0.118``. Raise for pipelines whose activations
-                grow faster with sequence length.
+                ``batch × seq_len`` tokens) of that fit. Raise it for
+                pipelines whose activations grow faster with sequence
+                length.
             auto_block_pin_act_safety_factor: Multiplier on the activation
-                estimate before adding the platform headroom. Default
-                ``1.5``.
+                estimate before the platform headroom is added.
+            auto_block_pin_act_safety_factor_measured: The same multiplier,
+                used instead when the slope came from a
+                :class:`~diffusers_mm.model_profiles.ModelProfile`, which
+                needs far less cushion than the generic default.
             auto_block_pin_act_fallback_gb: Activation estimate used when
                 no workload has been recorded via
-                :meth:`set_block_pin_workload`. Default ``4.0`` GiB.
+                :meth:`set_block_pin_workload`.
+            auto_block_pin_allocator_inflation: Multiplier turning the
+                sequence-length part of the activation estimate into a
+                reserved-pool figure for the pin budget. Neutral off
+                Windows.
+            auto_block_pin_allocator_inflation_windows: The same, on Windows.
+            auto_block_pin_allocator_pool_overhead_gb: Fixed pool overhead
+                (GiB) added to the pin budget on top of the platform
+                headroom. Neutral off Windows.
+            auto_block_pin_allocator_pool_overhead_windows_gb: The same, on
+                Windows. Follows the streaming configuration rather than the
+                model, so measure it for unusual block geometry.
         """
         self._lock = threading.RLock()
         self._component_cache: dict[str, Any] = {}
@@ -408,6 +384,7 @@ class ModelManager:
         self._unload_text_encoders: bool = bool(unload_text_encoders)
         self._text_encoder_unload_handles: list[Any] = []
         self._block_pin_spill_recalibrations: int = 0
+        self._workload_fit_warned: set[tuple[str, int]] = set()
 
         # Per-instance overrides for the auto-resolver constants. We
         # shadow the class attribute with an instance attribute only
@@ -444,6 +421,16 @@ class ModelManager:
             self.AUTO_BLOCK_PIN_ACT_SAFETY_FACTOR_MEASURED = float(auto_block_pin_act_safety_factor_measured)
         if auto_block_pin_act_fallback_gb is not None:
             self.AUTO_BLOCK_PIN_ACT_FALLBACK_GB = float(auto_block_pin_act_fallback_gb)
+        if auto_block_pin_allocator_inflation is not None:
+            self.AUTO_BLOCK_PIN_ALLOCATOR_INFLATION = float(auto_block_pin_allocator_inflation)
+        if auto_block_pin_allocator_inflation_windows is not None:
+            self.AUTO_BLOCK_PIN_ALLOCATOR_INFLATION_WINDOWS = float(auto_block_pin_allocator_inflation_windows)
+        if auto_block_pin_allocator_pool_overhead_gb is not None:
+            self.AUTO_BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_GB = float(auto_block_pin_allocator_pool_overhead_gb)
+        if auto_block_pin_allocator_pool_overhead_windows_gb is not None:
+            self.AUTO_BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_WINDOWS_GB = float(
+                auto_block_pin_allocator_pool_overhead_windows_gb
+            )
 
     # ------------------------------------------------------------------
     # Strategy properties
@@ -495,9 +482,8 @@ class ModelManager:
 
         The trade-off is one extra ~``pinned_size`` CPU↔GPU transfer per
         eviction/repin cycle. For the common single-stage video flow
-        (encode → denoise loop → decode), that's two extra transfers
-        total — typically 1–2 s on PCIe 4 — in exchange for freeing
-        several GiB of VRAM during decode.
+        (encode → denoise loop → decode), that's two extra transfers in
+        exchange for freeing the pinned subset's VRAM during decode.
         """
         with self._lock:
             return self._block_pin_auto_evict
@@ -682,7 +668,7 @@ class ModelManager:
             except TypeError:
                 logger.debug(
                     "register_components: source %s is not weakref-able; "
-                    "auto-cleanup on GC won't fire — caller must call "
+                    "auto-cleanup on GC won't fire - caller must call "
                     "unregister_components explicitly.",
                     type(source).__name__,
                 )
@@ -748,7 +734,7 @@ class ModelManager:
                     processed.append(name)
                 else:
                     logger.debug(
-                        "unregister_components: skipping %r — slot was displaced by another source",
+                        "unregister_components: skipping %r - slot was displaced by another source",
                         name,
                     )
             return processed
@@ -827,7 +813,7 @@ class ModelManager:
 
         if cached is not None and isinstance(cached, nn.Module):
             self.register_component(name, cached)
-            logger.info("load_component: cache hit for identifier %r → %r", identifier, name)
+            logger.info("load_component: cache hit for identifier %r -> %r", identifier, name)
             return cached
 
         module = factory()
@@ -841,7 +827,7 @@ class ModelManager:
                 logger.info("load_component: lost cache race for identifier %r, using winner", identifier)
             else:
                 self._component_cache[cache_key] = module
-                logger.info("load_component: cache miss for identifier %r, loaded → %r", identifier, name)
+                logger.info("load_component: cache miss for identifier %r, loaded -> %r", identifier, name)
 
         self.register_component(name, module)
         return module
@@ -1046,13 +1032,13 @@ class ModelManager:
                 return
             if self._model_profile is not None:
                 logger.debug(
-                    "model profile for %s ignored — already using one from an earlier source",
+                    "model profile for %s ignored - already using one from an earlier source",
                     type(source).__name__,
                 )
                 return
             self._model_profile = profile
         logger.info(
-            "model profile: %s → denoiser_concurrency=%s%s (%s)",
+            "model profile: %s -> denoiser_concurrency=%s%s (%s)",
             type(source).__name__,
             profile.denoiser_concurrency or "unset",
             f", role overrides {dict(profile.roles)}" if profile.roles else "",
@@ -1187,7 +1173,7 @@ class ModelManager:
             else:
                 chosen = "group_offload"
             logger.info(
-                "auto: vram=%.1f / %.1f GB (no components yet) → %s",
+                "auto: vram=%.1f / %.1f GB (no components yet) -> %s",
                 vram_avail_gb,
                 vram_total_gb,
                 chosen,
@@ -1246,7 +1232,7 @@ class ModelManager:
         logger.info(
             "auto: vram=%.1f / %.1f GB, ram=%.1f / %.1f GB, pipeline=%.1f GB "
             "(largest %.1f GB, concurrent working set %.1f GB, "
-            "denoiser_concurrency=%s, co-resident denoisers=%d) → %s",
+            "denoiser_concurrency=%s, co-resident denoisers=%d) -> %s",
             vram_avail_gb,
             vram_total_gb,
             ram_avail_gb,
@@ -1431,7 +1417,7 @@ class ModelManager:
                 self._block_pin_counts[name] = st.n_pinned
             freed_gb += actually * per_block_gb
             unpinned_total += actually
-            logger.info("block_pin %s: %s %d → %d pinned blocks", reason, name, old_n, st.n_pinned)
+            logger.info("block_pin %s: %s %d -> %d pinned blocks", reason, name, old_n, st.n_pinned)
 
         if unpinned_total:
             gc.collect()
@@ -1557,9 +1543,8 @@ class ModelManager:
         if (seq_len, batch) == (prev_seq, prev_batch):
             return  # Already budgeted for exactly this workload.
 
-        current_need_gb = self._resolve_working_set_gb()
-        observed_act = self._activation_estimate_gb(seq_len, batch) * self._act_safety_factor()
-        observed_need_gb = observed_act + self._resolve_working_set_headroom_gb()
+        current_need_gb = self._resolve_pin_budget_working_set_gb()
+        observed_need_gb = self._working_set_for_workload_gb(seq_len, batch, pool_aware=True)
         if observed_need_gb <= current_need_gb:
             # The budget already reserves at least this much — don't downgrade it.
             return
@@ -1567,8 +1552,8 @@ class ModelManager:
         self.set_block_pin_workload(seq_len, batch, activation_scale=scale)
         free_gb = self._effective_free_vram_gb(device)
         logger.info(
-            "block_pin workload probe: observed seq_len=%d batch=%d (budgeted for %d/%d) → "
-            "working set %.2f → %.2f GiB, effective free %.2f GiB",
+            "block_pin workload probe: observed seq_len=%d batch=%d (budgeted for %d/%d) -> "
+            "working set %.2f -> %.2f GiB, effective free %.2f GiB",
             seq_len,
             batch,
             prev_seq,
@@ -1584,7 +1569,7 @@ class ModelManager:
         if unpinned == 0:
             logger.warning(
                 "block_pin workload probe: seq_len=%d needs ~%.1f GiB working set but only %.1f GiB is free "
-                "and there are no pinned blocks left to unpin. This workload may OOM — "
+                "and there are no pinned blocks left to unpin. This workload may OOM - "
                 "consider a smaller resolution/duration or strategy='group_offload'.",
                 seq_len,
                 observed_need_gb,
@@ -1592,19 +1577,17 @@ class ModelManager:
             )
             return
         logger.info(
-            "block_pin workload probe: unpinned %d block(s) (~%.1f GiB) → effective free %.2f GiB",
+            "block_pin workload probe: unpinned %d block(s) (~%.1f GiB) -> effective free %.2f GiB",
             unpinned,
             freed_gb,
             self._effective_free_vram_gb(device),
         )
 
     # Minimum blocks a rebalance must be able to regain before it bothers
-    # re-pinning. Effectively "any", and deliberately so: re-pinning a block
-    # costs one host-to-device transfer (~8 ms for a 0.38 GiB block on PCIe 5
-    # x16), while leaving it streamed costs ~15-27 ms on *every* denoise step.
-    # A single block therefore repays its transfer on the first step of the
-    # run, and a 30-step generation returns it thirtyfold. Exposed as a knob
-    # for anyone who would rather trade that away for zero churn.
+    # re-pinning. Effectively "any", and deliberately so: re-pinning costs one
+    # host-to-device transfer, while leaving a block streamed costs a transfer on
+    # *every* denoise step, so a single block repays itself on the first step.
+    # Exposed as a knob for anyone who would rather have zero churn.
     _BLOCK_PIN_REPIN_MIN_BLOCKS = 1
 
     def _rebalance_block_pin(self, device: torch.device | str, *, reason: str) -> tuple[int, int]:
@@ -1618,10 +1601,8 @@ class ModelManager:
         The direction that only this method can supply matters in a long-lived
         process: a big generation shrinks the pin count to fit its activations,
         and without a way back every later small generation inherits that count
-        and keeps paying the per-block streaming cost — measured at ~27 ms per
-        block, which is 2% of a 58k-token step but 28% of a 15k-token one. The
-        ratchet has to turn both ways or the first big job silently taxes the
-        rest of the session.
+        and keeps paying the per-block streaming cost. The ratchet has to turn
+        both ways or the first big job silently taxes the rest of the session.
 
         Budgets against *effective* free VRAM plus what the component's own
         pinned blocks currently hold — i.e. "if I released everything I pinned,
@@ -1644,7 +1625,7 @@ class ModelManager:
         if not states:
             return 0, 0
 
-        working_set_gb = self._resolve_working_set_gb()
+        working_set_gb = self._resolve_pin_budget_working_set_gb()
         offload_kwargs = self._group_offload_kwargs(dev)
         pinned_total = unpinned_total = 0
 
@@ -1670,6 +1651,9 @@ class ModelManager:
             resident_gb = st.n_pinned * per_block_gb if st.resident else 0.0
             capacity_gb = free_gb + resident_gb - working_set_gb - per_block_gb
             target = max(0, min(int(capacity_gb / per_block_gb), len(blocks)))
+            # A profiled architecture's call-time workload lands here rather than
+            # in the apply-time budget, so this path needs the warning too.
+            self._warn_workload_does_not_fit(name, working_set_gb, free_gb + resident_gb - per_block_gb)
 
             if target < st.n_pinned:
                 moved = unpin_blocks(st, st.n_pinned - target, offload_kwargs)
@@ -1684,7 +1668,7 @@ class ModelManager:
             with self._lock:
                 self._block_pin_counts[name] = st.n_pinned
             logger.info(
-                "block_pin %s: %s → %d/%d pinned blocks (working set %.2f GiB)",
+                "block_pin %s: %s -> %d/%d pinned blocks (working set %.2f GiB)",
                 reason,
                 name,
                 st.n_pinned,
@@ -1727,16 +1711,17 @@ class ModelManager:
         if (seq_len, batch) == prev:
             return  # Already budgeted for exactly this job.
 
-        before_gb = self._resolve_working_set_gb()
+        # The pin-budget figure, since that is what the rebalance below spends.
+        before_gb = self._resolve_pin_budget_working_set_gb()
         self.set_block_pin_workload(seq_len, batch, activation_scale=scale)
         logger.info(
-            "block_pin: workload from call args seq_len=%d batch=%d (was %d/%d) → working set %.2f → %.2f GiB",
+            "block_pin: workload from call args seq_len=%d batch=%d (was %d/%d) -> working set %.2f -> %.2f GiB",
             seq_len,
             batch,
             prev[0],
             prev[1],
             before_gb,
-            self._resolve_working_set_gb(),
+            self._resolve_pin_budget_working_set_gb(),
         )
         self._rebalance_block_pin(device, reason="call workload")
 
@@ -1747,9 +1732,8 @@ class ModelManager:
         Group offloading with ``low_cpu_mem_usage=False`` pins a full host copy
         of every streamed weight, and that pool outlives the tensors: dropping
         the module and running ``gc.collect()`` frees nothing, because the
-        caching host allocator keeps the pages for reuse. Measured on a 8 GiB
-        pinned buffer — ``del`` + ``gc`` left RSS at 8.59 GiB; this call took it
-        to 0.59 GiB.
+        caching host allocator keeps the pages for reuse. This is the only call
+        that hands them back.
 
         Returns ``True`` if the release was attempted, ``False`` on a torch
         build that doesn't expose it (the private API arrived in torch 2.5).
@@ -1772,8 +1756,8 @@ class ModelManager:
         after which the text encoder is dead weight for the rest of the call —
         yet its weights stay resident and, under group offload, keep a pinned
         host copy the same size as the weights themselves. On a pipeline whose
-        text encoder is the largest component (MiniMax-H3: 32.6 GiB of 57.2)
-        that is the single biggest block of reclaimable memory in the process.
+        text encoder is the largest component that is the single biggest block of
+        reclaimable memory in the process.
 
         Role-based, so it covers the older multi-encoder pipelines (SDXL's
         ``text_encoder`` + ``text_encoder_2``, SD3's three) with no per-model
@@ -1992,7 +1976,7 @@ class ModelManager:
             return False
         logger.warning(
             "%s uses legacy torch.nn.utils.weight_norm (at %r), which is incompatible with "
-            "group offloading — its recomputed `weight` would stay on the CPU. Keeping it "
+            "group offloading - its recomputed `weight` would stay on the CPU. Keeping it "
             "resident on %s instead (%.2f GiB of VRAM).",
             name,
             wn,
@@ -2134,15 +2118,59 @@ class ModelManager:
             return self.AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB
         return self.AUTO_BLOCK_PIN_WORKING_SET_GB
 
+    def _warn_workload_does_not_fit(self, component_name: str, working_set_gb: float, room_gb: float) -> None:
+        """Warn when the working set alone leaves no room, so no pin count helps.
+
+        Deduplicated per (component, workload): the budget is recomputed every
+        call, the news is only new once.
+        """
+        if working_set_gb <= room_gb:
+            return
+        with self._lock:
+            seq_len = self._block_pin_seq_len
+            key = (component_name, seq_len)
+            if key in self._workload_fit_warned:
+                return
+            self._workload_fit_warned.add(key)
+        # Windows absorbs the overflow into shared memory and only gets slow;
+        # elsewhere it raises.
+        consequence = (
+            "Expect the overflow to spill into shared memory and the run to get several times slower"
+            if sys.platform == "win32"
+            else "Expect a CUDA out-of-memory error"
+        )
+        logger.warning(
+            "block_pin: this workload does not fit %s regardless of pinning - the denoise working "
+            "set alone needs ~%.1f GiB but only ~%.1f GiB is available for it (short by ~%.1f GiB%s). "
+            "%s. The working set scales with the denoise sequence length, so fewer frames or a "
+            "smaller resolution is what reduces it.",
+            component_name,
+            working_set_gb,
+            room_gb,
+            working_set_gb - room_gb,
+            f", seq_len={seq_len}" if seq_len > 0 else "",
+            consequence,
+        )
+
+    def _resolve_allocator_inflation(self) -> float:
+        """Multiplier on the activation term of the pin budget, per platform."""
+        if sys.platform == "win32":
+            return self.AUTO_BLOCK_PIN_ALLOCATOR_INFLATION_WINDOWS
+        return self.AUTO_BLOCK_PIN_ALLOCATOR_INFLATION
+
+    def _resolve_allocator_pool_overhead_gb(self) -> float:
+        """Fixed reserved-pool overhead (GiB) for the pin budget, per platform."""
+        if sys.platform == "win32":
+            return self.AUTO_BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_WINDOWS_GB
+        return self.AUTO_BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_GB
+
     def _activation_fit(self) -> tuple[float, float, bool]:
         """``(intercept_gb, slope_gb_per_ktoken, is_measured)`` for the architecture.
 
         Resolution order, most specific first: an explicit ctor value → the
         registered pipeline's :class:`ModelProfile` measurement → the class
-        default. The default has to cover every unmeasured architecture, and the
-        measured spread is wide (0.13 GiB/ktoken for LTX-2.3 / Krea 2 up to 0.60
-        for Ideogram4, whose per-token LLM features dominate), so a profile
-        measurement should be preferred wherever one exists.
+        default. The spread across architectures is wide enough that the default
+        cannot serve them all, so prefer a profile measurement where one exists.
         """
         intercept = self.AUTO_BLOCK_PIN_ACT_INTERCEPT_GB
         slope = self.AUTO_BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN
@@ -2192,22 +2220,57 @@ class ModelManager:
         intercept, slope, _ = self._activation_fit()
         return (intercept + slope * ktokens) * scale
 
-    def _resolve_working_set_gb(self) -> float:
-        """Working-set VRAM (GB) to reserve per block_pin component.
+    def _working_set_for_workload_gb(self, seq_len: int, batch: int, *, pool_aware: bool = False) -> float:
+        """Working-set VRAM (GB) a denoise forward of this shape needs.
 
-        ``activation_estimate × SAFETY_FACTOR + platform_headroom``, using
-        the workload recorded via :meth:`set_block_pin_workload`. Scales with
-        video size / length instead of a flat constant; falls back to a fixed
-        activation estimate when the workload is unknown. Also serves as the
-        eviction threshold (a neighbor triggers pinned-block eviction before
-        its onload would OOM) and the ``no_offload`` activation reserve, so
-        all three stay self-consistent.
+        ``activation_estimate × SAFETY_FACTOR + platform_headroom``, plus the
+        reserved-pool correction when *pool_aware*.
+
+        Only the pin budget wants ``pool_aware=True``, because pinned blocks are
+        what the pool competes with. Eviction must not: it compares against
+        :meth:`_effective_free_vram_gb`, which already adds the reclaimable pool
+        back on the other side, so correcting both would double-count it and
+        re-introduce the warm-up thrash that method prevents. Strategy choice
+        must not either: it compares options that run the same forward, so the
+        pool cancels.
+
+        Split out from :meth:`_resolve_working_set_gb` so the forward-time probe
+        prices an observed workload with the same formula the budget was built
+        with.
+        """
+        act = self._activation_estimate_gb(seq_len, batch) * self._act_safety_factor()
+        if pool_aware:
+            return (
+                act * self._resolve_allocator_inflation()
+                + self._resolve_allocator_pool_overhead_gb()
+                + self._resolve_working_set_headroom_gb()
+            )
+        return act + self._resolve_working_set_headroom_gb()
+
+    def _resolve_working_set_gb(self) -> float:
+        """Peak *live* working-set VRAM (GB) for the recorded workload.
+
+        The workload recorded via :meth:`set_block_pin_workload` priced by
+        :meth:`_working_set_for_workload_gb`. Scales with video size / length
+        instead of a flat constant; falls back to a fixed activation estimate
+        when the workload is unknown. Serves the eviction threshold (a neighbor
+        triggers pinned-block eviction before its onload would OOM), the
+        ``no_offload`` activation reserve and the strategy-choice checks.
+
+        For the block_pin **pin budget**, use
+        :meth:`_resolve_pin_budget_working_set_gb` instead.
         """
         with self._lock:
             seq_len = self._block_pin_seq_len
             batch = self._block_pin_batch
-        act = self._activation_estimate_gb(seq_len, batch) * self._act_safety_factor()
-        return act + self._resolve_working_set_headroom_gb()
+        return self._working_set_for_workload_gb(seq_len, batch)
+
+    def _resolve_pin_budget_working_set_gb(self) -> float:
+        """VRAM (GB) that must stay free for the forward, as a *reserved pool*."""
+        with self._lock:
+            seq_len = self._block_pin_seq_len
+            batch = self._block_pin_batch
+        return self._working_set_for_workload_gb(seq_len, batch, pool_aware=True)
 
     def _compute_block_pin_count(
         self,
@@ -2239,18 +2302,21 @@ class ModelManager:
 
         vram_avail_gb, _ = self._detect_available_vram_gb(device)
         non_block_gb = non_block_size_bytes(component, block_attr) / (1024**3)
-        working_set_gb = self._resolve_working_set_gb()
+        working_set_gb = self._resolve_pin_budget_working_set_gb()
 
         budget_gb = vram_avail_gb - non_block_gb - working_set_gb - per_block_gb
         if budget_gb <= 0:
             logger.warning(
-                "block_pin: %s — no VRAM budget for pinning (avail=%.1f, non_block=%.1f, "
-                "working_set=%.1f, streamed_in_flight=%.2f) → 0 pinned, all blocks stream",
+                "block_pin: %s - no VRAM budget for pinning (avail=%.1f, non_block=%.1f, "
+                "working_set=%.1f, streamed_in_flight=%.2f) -> 0 pinned, all blocks stream",
                 component_name,
                 vram_avail_gb,
                 non_block_gb,
                 working_set_gb,
                 per_block_gb,
+            )
+            self._warn_workload_does_not_fit(
+                component_name, working_set_gb, vram_avail_gb - non_block_gb - per_block_gb
             )
             return 0
 
@@ -2264,8 +2330,8 @@ class ModelManager:
 
         Block-pin tightly budgets VRAM (pinned blocks + non-block parts +
         a working-set margin). Without ``expandable_segments``, allocator
-        fragmentation can swallow 1–2 GiB and turn a careful budget into
-        an OOM. Logged as a one-time hint when the strategy is applied.
+        fragmentation eats into that budget and can turn it into an OOM.
+        Logged as a one-time hint when the strategy is applied.
 
         Windows is skipped — ``expandable_segments`` depends on the CUDA
         virtual memory management API not exposed on the Windows driver,
@@ -2280,8 +2346,8 @@ class ModelManager:
         if "expandable_segments:True" not in conf:
             logger.warning(
                 "block_pin: PYTORCH_CUDA_ALLOC_CONF does not include "
-                "'expandable_segments:True'. Allocator fragmentation may "
-                "consume ~1-2 GiB and cause OOM. Recommended: set "
+                "'expandable_segments:True'. Allocator fragmentation eats into "
+                "the pin budget and can cause OOM. Recommended: set "
                 "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before "
                 "starting Python."
             )
@@ -2958,7 +3024,7 @@ class ModelManager:
                         offload_kwargs=offload_kwargs,
                     )
                     logger.info(
-                        "block_pin: %s — pinned %d/%d %s blocks, streaming %d",
+                        "block_pin: %s - pinned %d/%d %s blocks, streaming %d",
                         name,
                         applied_n,
                         len(blocks),
@@ -3149,20 +3215,18 @@ class ModelManager:
           its pool. Allocated + free-but-cached. This is what shrinks
           back when you call :func:`torch.cuda.empty_cache`.
         - **External** — driver-used minus PyTorch-reserved. Everything
-          on the device that PyTorch doesn't manage. On a typical run
-          this is CUDA context (~1 GiB) plus cuDNN workspaces. If it's
-          way bigger than that, suspect a non-PyTorch allocator (Triton,
-          cuFFT plans, etc.).
+          on the device that PyTorch doesn't manage: normally the CUDA
+          context plus cuDNN workspaces. If it is much larger, suspect a
+          non-PyTorch allocator (Triton, cuFFT plans, etc.).
 
         Crucially, this is the *dedicated* side only. On Windows, Task
         Manager's "GPU Memory" line is dedicated + shared. Shared GPU
         memory is CUDA-pinned host memory (system RAM mapped to GPU
         address space) — created by ``apply_group_offloading`` when
         ``low_cpu_mem_usage=True`` so streamed weights can transfer
-        without per-call pinning. That's not directly queryable from
-        CUDA, so it's not in this breakdown — but it's the most common
-        explanation when this method says "PyTorch peak is 9 GiB" while
-        Task Manager says "21 GiB".
+        without per-call pinning. CUDA cannot report it, so it is absent
+        here — but it is the usual reason Task Manager shows far more than
+        this breakdown accounts for.
 
         Returns the same numbers as a dict for programmatic use.
         """

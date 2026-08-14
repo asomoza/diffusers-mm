@@ -4,65 +4,53 @@ Plain floats/ints with no ``torch`` import, so ``ModelManager`` and any
 caller computing an activation scale can share one source of truth without
 pulling heavy dependencies or drifting out of sync.
 
-The activation-fit constants below are calibrated on LTX-2.3 distilled (a
-video DiT) — see :meth:`ModelManager.set_block_pin_workload`. The denoise
-working set is bf16 regardless of weight quantization, so the fit generalises
-across int4 / int8 / bf16. For pipelines with a very different
-activation-vs-sequence-length profile, override the matching ``AUTO_*``
-attribute on the manager (subclass, ctor arg, or instance assignment).
+Every value here is a starting point calibrated on a video DiT, not a constant of
+nature. Each has a matching ``AUTO_*`` attribute on ``ModelManager`` (subclass,
+ctor arg, or instance assignment) for pipelines that behave differently.
 """
 
 # --- block_pin working set (activation reserve) -----------------------------
 # The working set reserved per block_pin component is
-#   ``activation_estimate(seq_len, batch) * SAFETY_FACTOR + platform_headroom``.
-# The activation estimate is a linear fit measured on a resolution/duration
-# sweep: the denoise-loop peak minus the resident transformer weights is
-# cleanly linear in ``seq_len`` with a small slope and near-zero intercept.
+#   ``activation_estimate(seq_len, batch) * SAFETY_FACTOR + platform_headroom``
+# where the activation estimate is a linear fit in the denoise sequence length,
 #   seq_len = (W / spatial) * (H / spatial) * ((frames - 1) / temporal + 1)
-#
-# These are the fallback for an architecture with no measured
-# ``ModelProfile.act_slope_gb_per_ktoken``. The slope was raised from 0.118 to
-# 0.16 in 2026-08 after direct measurement (see
-# ``demo_scripts/measure_activation_slope.py``) found *every* model tested sat
-# above the old value — including LTX-2.3, the model it was originally derived
-# from, which measures 0.136. 0.16 covers the measured cluster (LTX-2.3 0.136,
-# Krea 2 0.134, MiniMax-H3 0.158) with a little margin. It deliberately does
-# *not* try to cover outliers like Ideogram4 (0.60): stretching the default that
-# far would over-reserve for every ordinary model, so outliers get a profile.
-# The intercept stays at 0.30 despite measuring near zero on most models — it is
-# a cheap fixed cushion that matters only for small workloads, where being
-# generous is free.
+# and activations are bf16 whatever the weights are, so the fit carries across
+# quantization. Fallbacks only: an architecture with a measured
+# ``ModelProfile.act_slope_gb_per_ktoken`` uses that instead, which is the better
+# route for anything whose activations scale unusually.
 BLOCK_PIN_ACT_INTERCEPT_GB = 0.30
 BLOCK_PIN_ACT_SLOPE_GB_PER_KTOKEN = 0.16
-# Multiplier on the activation estimate before adding platform headroom
-# (measured denoise peak -> safe ceiling, covering cross-model variance and
-# neighbor-onload transients).
+# Lifts the bare fit to a safe ceiling, covering cross-model variance and
+# neighbor-onload transients.
 BLOCK_PIN_ACT_SAFETY_FACTOR = 1.5
-# Safety factor used when the slope came from a **measured**
-# ``ModelProfile.act_slope_gb_per_ktoken`` rather than the generic default.
-# Most of the 1.5x above is cushion for not knowing the architecture's real
-# slope; once it *is* known, keeping 1.5x double-counts. On MiniMax-H3 at
-# 104k tokens, 1.5x on the measured slope reserves 27.1 GiB of a 27.7 GiB card
-# and pins **zero** blocks — strictly worse than the under-budget it replaced.
-# 1.2x reproduces roughly the pin count that measurably worked, and still
-# covers the ~7% the probe misses (latents and text embeds held across the
-# step, stream staging, allocator slack).
+# The same, for a profile-supplied slope: most of the factor above is cushion for
+# not knowing the architecture's real slope, so keeping it on a measurement
+# double-counts and can reserve enough to pin nothing at all.
 BLOCK_PIN_ACT_SAFETY_FACTOR_MEASURED = 1.2
 # Activation estimate used when the denoise seq_len is unknown at pin time
 # (i.e. the caller never called ``set_block_pin_workload``).
 BLOCK_PIN_ACT_FALLBACK_GB = 4.0
-# Platform safety headroom added on top of the activation estimate. Covers
-# allocator fragmentation, the group-offload stream double-buffer, and modest
-# attention overhead. Windows is higher because ``expandable_segments`` is
-# Linux-only and the Windows allocator reserves more under the same load.
+
+# --- caching-allocator reserved-pool model -----------------------------------
+# Corrects the pin budget from peak *live* bytes to the allocator's *reserved
+# pool*, which is what pinned blocks actually compete with: a fixed overhead plus
+# a multiplier on the activation estimate. Neutral off Windows, where
+# ``expandable_segments`` keeps pool close to live. Raise if
+# ``max_memory_reserved`` runs above ``max_memory_allocated`` on your setup.
+BLOCK_PIN_ALLOCATOR_INFLATION = 1.0
+BLOCK_PIN_ALLOCATOR_INFLATION_WINDOWS = 1.25
+BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_GB = 0.0
+BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_WINDOWS_GB = 3.0
+# Platform safety headroom on top of the activation estimate: allocator
+# fragmentation, the group-offload stream double-buffer, attention overhead.
+# Higher on Windows, which has no ``expandable_segments``.
 BLOCK_PIN_WORKING_SET_HEADROOM_GB = 2.0
 BLOCK_PIN_WORKING_SET_HEADROOM_WINDOWS_GB = 3.0
 
 # --- conditioning / LoRA activation scaling ---------------------------------
-# These inflate the base activation estimate so block_pin pins fewer blocks up
-# front when the denoise forward will allocate more than a plain text-to-X
-# pass — avoiding reactive OOM. All scale with seq_len (they multiply the base
-# activation), so they're expressed as additive contributions to a multiplier.
+# Inflate the base activation estimate so block_pin pins fewer blocks up front
+# when the forward will allocate more than a plain text-to-X pass. They multiply
+# the base activation, so they read as additive contributions to a multiplier.
 #
 # LoRA: each active adapter adds ``lora_B(lora_A(x))`` forward temporaries.
 BLOCK_PIN_LORA_ACT_FACTOR = 0.5
@@ -70,7 +58,7 @@ BLOCK_PIN_LORA_ACT_FACTOR = 0.5
 # VAE peak coexisting with the pinned transformer.
 BLOCK_PIN_IMAGE_COND_ACT_FACTOR = 0.65
 # Video conditioning (V2V replace): VAE-encodes the whole source clip while the
-# transformer is pinned, plus multi-frame clean latents — the heaviest.
+# transformer is pinned, plus multi-frame clean latents.
 BLOCK_PIN_VIDEO_COND_ACT_FACTOR = 1.5
 # Keyframe / concat conditioning: appends tokens (can double the token count)
 # and may disable flash attention (O(seq^2)). Kept >= replace as a guard.
@@ -90,9 +78,6 @@ def block_pin_activation_scale(
     conditioning so block_pin reserves more working set (pins fewer blocks)
     before it would OOM. Conservative by design — pass the result as
     ``activation_scale`` to :meth:`ModelManager.set_block_pin_workload`.
-
-    This is a heuristic starting point calibrated on a video DiT; tune the
-    ``BLOCK_PIN_*_ACT_FACTOR`` constants for your pipeline if needed.
     """
     scale = 1.0 + BLOCK_PIN_LORA_ACT_FACTOR * max(0, lora_count)
     if image_cond:
