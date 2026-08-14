@@ -3520,3 +3520,183 @@ class TestPrepareBlockPinForCall:
         monkeypatch.setattr(mm, "_rebalance_block_pin", lambda d, reason: calls.append(reason) or (0, 0))
         mm._prepare_block_pin_for_call(pipe, kwargs, "cpu")
         assert calls == []
+
+
+class _FakeMultiEncoderPipe:
+    """Two text encoders plus a denoiser — the SDXL/SD3 shape."""
+
+    def __init__(self):
+        self.text_encoder = nn.Linear(4, 4)
+        self.text_encoder_2 = nn.Linear(4, 4)
+        self.transformer = _FakeTransformer()
+
+    @property
+    def components(self):
+        return {
+            "text_encoder": self.text_encoder,
+            "text_encoder_2": self.text_encoder_2,
+            "transformer": self.transformer,
+        }
+
+
+class TestUnloadTextEncoders:
+    """Prompt encoding is done once the denoise loop starts, so the encoders are
+    dead weight for the rest of the call. Dropping them has to clear the
+    *pipeline's* attribute too — that reference is what keeps the weights
+    alive — and release the pinned host pool, which survives `del` + `gc`."""
+
+    def _mm(self, monkeypatch, **kwargs):
+        _stub_group_offload(monkeypatch)
+        return ModelManager(strategy="group_offload", **kwargs)
+
+    def test_drops_every_text_encoder_by_role(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+        pipe = _FakeMultiEncoderPipe()
+        mm.register_components(pipe)
+        mm.apply_offload_strategy("cpu")
+
+        dropped = mm.unload_text_encoders()
+
+        # Role-based, so multi-encoder pipelines come along for free.
+        assert sorted(dropped) == ["text_encoder", "text_encoder_2"]
+        assert "transformer" in mm.component_names
+        assert "text_encoder" not in mm.component_names
+        # The pipeline's own reference is cleared, or nothing is actually freed.
+        assert pipe.text_encoder is None
+        assert pipe.text_encoder_2 is None
+
+    def test_releases_host_cache(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+        pipe = _FakeMultiEncoderPipe()
+        mm.register_components(pipe)
+        mm.apply_offload_strategy("cpu")
+
+        calls = []
+        monkeypatch.setattr(ModelManager, "release_host_cache", staticmethod(lambda: calls.append(1) or True))
+        mm.unload_text_encoders()
+        assert calls == [1]
+
+    def test_opt_out_of_host_cache_release(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+        pipe = _FakeMultiEncoderPipe()
+        mm.register_components(pipe)
+        mm.apply_offload_strategy("cpu")
+
+        calls = []
+        monkeypatch.setattr(ModelManager, "release_host_cache", staticmethod(lambda: calls.append(1) or True))
+        mm.unload_text_encoders(release_host_cache=False)
+        assert calls == []
+
+    def test_no_text_encoder_is_a_no_op(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+        mm.register_component("transformer", _FakeTransformer())
+        mm.apply_offload_strategy("cpu")
+        assert mm.unload_text_encoders() == []
+
+    def test_hook_fires_on_first_denoiser_forward(self, monkeypatch):
+        mm = self._mm(monkeypatch, unload_text_encoders=True)
+        pipe = _FakeMultiEncoderPipe()
+        mm.register_components(pipe)
+        mm.apply_offload_strategy("cpu")
+        assert pipe.text_encoder is not None
+
+        pipe.transformer(torch.zeros(1, 4))
+
+        assert pipe.text_encoder is None
+        assert "text_encoder" not in mm.component_names
+
+    def test_hook_not_installed_when_disabled(self, monkeypatch):
+        mm = self._mm(monkeypatch)  # default: opt-in, so off
+        pipe = _FakeMultiEncoderPipe()
+        mm.register_components(pipe)
+        mm.apply_offload_strategy("cpu")
+
+        pipe.transformer(torch.zeros(1, 4))
+
+        assert pipe.text_encoder is not None
+        assert "text_encoder" in mm.component_names
+
+    def test_restore_reloads_when_source_supports_it(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+
+        class _Modularish(_FakeMultiEncoderPipe):
+            def __init__(self):
+                super().__init__()
+                self.reloaded = []
+
+            def load_components(self, names=None, **kwargs):
+                self.reloaded.append(list(names or []))
+                for n in names or []:
+                    setattr(self, n, nn.Linear(4, 4))
+
+        pipe = _Modularish()
+        mm.register_components(pipe)
+        mm.apply_offload_strategy("cpu")
+        mm.unload_text_encoders()
+
+        restored = mm.restore_dropped_components(pipe)
+        assert sorted(restored) == ["text_encoder", "text_encoder_2"]
+        assert pipe.text_encoder is not None
+        assert "text_encoder" in mm.component_names
+        # Second call has nothing pending.
+        assert mm.restore_dropped_components(pipe) == []
+
+    def test_restore_raises_clearly_when_it_cannot(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+        pipe = _FakeMultiEncoderPipe()  # no load_components
+        mm.register_components(pipe)
+        mm.apply_offload_strategy("cpu")
+        mm.unload_text_encoders()
+
+        # Better a clear error here than a NoneType failure deep in diffusers.
+        with pytest.raises(RuntimeError, match="unload_text_encoders"):
+            mm.restore_dropped_components(pipe)
+
+    def test_restore_is_a_no_op_for_untouched_pipelines(self, monkeypatch):
+        mm = self._mm(monkeypatch)
+        pipe = _FakeMultiEncoderPipe()
+        mm.register_components(pipe)
+        mm.apply_offload_strategy("cpu")
+        assert mm.restore_dropped_components(pipe) == []
+
+    def test_purges_manager_side_references(self, monkeypatch):
+        """The bug this guards: unregistering alone left the module referenced
+        by the per-source record and by the block_pin neighbor method-wrap list.
+        A single surviving reference makes the unload a silent no-op — measured
+        on the real pipeline as 0 GiB reclaimed instead of 36.5."""
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        pipe = _FakeMultiEncoderPipe()
+        encoder = pipe.text_encoder
+        mm.register_components(pipe)
+        mm.apply_offload_strategy("cpu")
+
+        mm.unload_text_encoders()
+
+        for record in mm._source_registrations.values():
+            assert "text_encoder" not in record
+        assert all(comp is not encoder for comp, _m, _r in mm._block_pin_wrapped_methods)
+
+    def test_module_is_collectable_after_unload(self, monkeypatch):
+        import logging as _logging
+        import weakref as _weakref
+
+        # Log records hold their `args`, which include the modules being logged
+        # about, and pytest retains records across several handlers. That is a
+        # harness-only reference, but it masks the result — so emit nothing.
+        _logging.disable(_logging.CRITICAL)
+
+        _stub_group_offload(monkeypatch)
+        mm = ModelManager(strategy="block_pin")
+        pipe = _FakeMultiEncoderPipe()
+        mm.register_components(pipe)
+        mm.apply_offload_strategy("cpu")
+        ref = _weakref.ref(pipe.text_encoder)
+
+        try:
+            mm.unload_text_encoders()
+            gc.collect()
+            # Nothing left holding it — the whole point of the feature.
+            assert ref() is None
+        finally:
+            _logging.disable(_logging.NOTSET)

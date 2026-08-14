@@ -35,6 +35,7 @@ def managed(
     block_pin_spill_margin_gb: float = _UNSET,
     block_pin_workload_probe: bool = _UNSET,
     block_pin_call_workload: bool = _UNSET,
+    unload_text_encoders: bool = _UNSET,
     auto_no_offload_factor: float = _UNSET,
     auto_model_offload_factor: float = _UNSET,
     auto_ram_headroom: float = _UNSET,
@@ -137,6 +138,20 @@ def managed(
             probe it rebalances in **both** directions, so a small generation
             following a large one recovers the pins the large one shed. Default
             True. Unprofiled architectures are unaffected.
+        unload_text_encoders: Drop the text encoder(s) as soon as the first
+            denoiser forward begins — prompt encoding is finished by then, and
+            they are dead weight for the rest of the generation. Frees their
+            weights *and* the pinned host copy group offload holds for them,
+            which on a text-encoder-dominated pipeline is the largest single
+            block of reclaimable memory (MiniMax-H3: 32.6 GiB of 57.2). Covers
+            multi-encoder pipelines (SDXL, SD3) by role, not by name.
+
+            Destructive and therefore opt-in: the pipeline's own attribute is
+            cleared, since that reference is what keeps the weights alive. A
+            following generation reloads them if the pipeline can
+            (``load_components``), otherwise it raises. Best suited to
+            one-shot or memory-starved runs — a long-lived process doing many
+            generations pays a full reload each time. Default False.
         auto_no_offload_factor: Activation margin for the ``no_offload``
             auto tier (``pipeline_weights × this`` must fit in VRAM).
             Default ``1.5``.
@@ -200,6 +215,7 @@ def managed(
         "block_pin_spill_margin_gb": block_pin_spill_margin_gb,
         "block_pin_workload_probe": block_pin_workload_probe,
         "block_pin_call_workload": block_pin_call_workload,
+        "unload_text_encoders": unload_text_encoders,
         "auto_no_offload_factor": auto_no_offload_factor,
         "auto_model_offload_factor": auto_model_offload_factor,
         "auto_ram_headroom": auto_ram_headroom,
@@ -264,6 +280,9 @@ def managed(
             # Size the block_pin budget from this call's own arguments before
             # the pipeline allocates anything. Never fatal: a failure here means
             # the previous budget stands and the forward-time probe still guards.
+            # Reload anything a previous generation's unload_text_encoders()
+            # dropped; raises with guidance if this pipeline can't reload.
+            _mm.restore_dropped_components(self, dev)
             try:
                 _mm._prepare_block_pin_for_call(self, kwargs, dev)
             except Exception as e:

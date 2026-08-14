@@ -30,7 +30,7 @@ from diffusers_mm.block_pin import (
     unpin_blocks,
 )
 from diffusers_mm.hooks import find_legacy_weight_norm, remove_offload_hooks
-from diffusers_mm.inventory import ComponentInfo, build_inventory
+from diffusers_mm.inventory import ComponentInfo, build_inventory, module_size_gb
 from diffusers_mm.model_profiles import (
     DENOISER_CONCURRENCY_MODES,
     ModelProfile,
@@ -180,6 +180,7 @@ class ModelManager:
         block_pin_spill_margin_gb: float = 0.5,
         block_pin_workload_probe: bool = True,
         block_pin_call_workload: bool = True,
+        unload_text_encoders: bool = False,
         *,
         auto_no_offload_factor: float | None = None,
         auto_model_offload_factor: float | None = None,
@@ -306,6 +307,16 @@ class ModelManager:
         # unregister_components. Dict sources aren't weakref-able, so the
         # entry may be missing for those.
         self._source_finalizers: dict[int, weakref.finalize] = {}
+        # Weak handles on the registered sources, parallel to
+        # ``_source_registrations``. Needed by :meth:`unload_text_encoders`,
+        # which must clear ``pipe.text_encoder`` as well as its own registry —
+        # the pipeline's attribute is a strong reference, so leaving it in place
+        # would free nothing.
+        self._source_refs: dict[int, weakref.ref] = {}
+        # Components dropped by :meth:`unload_text_encoders`, as
+        # ``name -> source_id``, so a later call can reload them (or explain
+        # why it can't).
+        self._dropped_components: dict[str, int] = {}
         # When model_offload installs accelerate's chained
         # ``cpu_offload_with_hook``, the last hook in the chain is kept here.
         # It can be used to manually offload the trailing component (the one
@@ -392,6 +403,10 @@ class ModelManager:
         # arguments (via the architecture's ``ModelProfile.workload_fn``) and
         # rebalance the pin count to match, before the pipeline body runs.
         self._block_pin_call_workload: bool = bool(block_pin_call_workload)
+        # Opt-in: drop the text encoder(s) once denoising starts, reclaiming
+        # both their weights and their pinned host copy for the rest of the run.
+        self._unload_text_encoders: bool = bool(unload_text_encoders)
+        self._text_encoder_unload_handles: list[Any] = []
         self._block_pin_spill_recalibrations: int = 0
 
         # Per-instance overrides for the auto-resolver constants. We
@@ -660,6 +675,10 @@ class ModelManager:
             # unregister.
             try:
                 self._source_finalizers[source_id] = weakref.finalize(source, self._on_source_gc, source_id)
+                # Keep a weak handle on the source itself too: dropping a
+                # component has to clear the pipeline's own attribute, or its
+                # reference keeps the weights alive and nothing is freed.
+                self._source_refs[source_id] = weakref.ref(source)
             except TypeError:
                 logger.debug(
                     "register_components: source %s is not weakref-able; "
@@ -1721,6 +1740,226 @@ class ModelManager:
         )
         self._rebalance_block_pin(device, reason="call workload")
 
+    @staticmethod
+    def release_host_cache() -> bool:
+        """Return PyTorch's pooled **pinned host** memory to the OS.
+
+        Group offloading with ``low_cpu_mem_usage=False`` pins a full host copy
+        of every streamed weight, and that pool outlives the tensors: dropping
+        the module and running ``gc.collect()`` frees nothing, because the
+        caching host allocator keeps the pages for reuse. Measured on a 8 GiB
+        pinned buffer — ``del`` + ``gc`` left RSS at 8.59 GiB; this call took it
+        to 0.59 GiB.
+
+        Returns ``True`` if the release was attempted, ``False`` on a torch
+        build that doesn't expose it (the private API arrived in torch 2.5).
+        """
+        release = getattr(torch._C, "_host_emptyCache", None)
+        if release is None:
+            logger.debug("torch._C._host_emptyCache() unavailable; pinned host memory stays pooled")
+            return False
+        try:
+            release()
+        except Exception as e:
+            logger.warning("Failed to release pinned host memory: %s", e)
+            return False
+        return True
+
+    def unload_text_encoders(self, *, release_host_cache: bool = True) -> list[str]:
+        """Drop every text-encoder component and reclaim its memory.
+
+        Prompt encoding happens once per generation, before the denoise loop,
+        after which the text encoder is dead weight for the rest of the call —
+        yet its weights stay resident and, under group offload, keep a pinned
+        host copy the same size as the weights themselves. On a pipeline whose
+        text encoder is the largest component (MiniMax-H3: 32.6 GiB of 57.2)
+        that is the single biggest block of reclaimable memory in the process.
+
+        Role-based, so it covers the older multi-encoder pipelines (SDXL's
+        ``text_encoder`` + ``text_encoder_2``, SD3's three) with no per-model
+        knowledge — see :func:`~diffusers_mm.inventory.classify_role`.
+
+        Destructive by design: the components are unregistered, their offload
+        hooks removed, **and the pipeline's own attribute is set to None**,
+        because that reference is what keeps the weights alive. A later
+        generation needs them back; :meth:`restore_dropped_components` reloads
+        them for sources that support it, and raises a clear error for those
+        that don't.
+
+        Returns the names actually dropped.
+        """
+        names = [c.name for c in self.classify_components() if c.role == "text_encoder"]
+        if not names:
+            return []
+
+        freed_gb = 0.0
+        dropped: list[str] = []
+        for name in names:
+            with self._lock:
+                module = self._managed_components.get(name)
+            if module is None:
+                continue
+            freed_gb += module_size_gb(module)
+            # Clear the attribute on every source that registered this name, or
+            # the pipeline keeps the module alive and nothing is reclaimed.
+            with self._lock:
+                sources = [(sid, rec) for sid, rec in self._source_registrations.items() if rec.get(name) is module]
+            for source_id, _rec in sources:
+                ref = self._source_refs.get(source_id)
+                source = ref() if ref is not None else None
+                if source is None:
+                    continue
+                try:
+                    setattr(source, name, None)
+                except Exception as e:
+                    logger.warning("Could not clear %s on %s: %s", name, type(source).__name__, e)
+                    continue
+                with self._lock:
+                    self._dropped_components[name] = source_id
+            self.unregister_component(name)
+            self._purge_component_references(name, module)
+            dropped.append(name)
+
+        if not dropped:
+            return []
+
+        del module, sources
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        released = self.release_host_cache() if release_host_cache else False
+        logger.info(
+            "Unloaded text encoder(s) %s (~%.2f GiB of weights); pinned host cache %s.",
+            dropped,
+            freed_gb,
+            "released" if released else "left pooled",
+        )
+        return dropped
+
+    def _purge_component_references(self, name: str, module: Any) -> None:
+        """Drop every *manager-side* strong reference to *module*.
+
+        Unregistering removes it from the active registry, but the manager keeps
+        it alive in two other places, and a single surviving reference makes the
+        whole unload pointless — the weights stay resident and the pinned host
+        pool has nothing free to release:
+
+        * ``_source_registrations``, the per-source record used for idempotent
+          registration and precise teardown, maps name → module strongly.
+        * ``_block_pin_wrapped_methods``, which holds the component whose
+          ``decode``/``encode`` were wrapped for auto-evict. A text encoder is a
+          *neighbor* under ``block_pin``, so it lands in that list.
+        """
+        with self._lock:
+            for record in self._source_registrations.values():
+                if record.get(name) is module:
+                    record.pop(name, None)
+
+            remaining: list[tuple[Any, str, Any]] = []
+            for component, method_name, restore_value in self._block_pin_wrapped_methods:
+                if component is not module:
+                    remaining.append((component, method_name, restore_value))
+                    continue
+                # Restore before dropping the entry so the module isn't left
+                # carrying a wrapper that closes over this manager.
+                try:
+                    if restore_value is _INSTANCE_ATTR_ABSENT:
+                        component.__dict__.pop(method_name, None)
+                    else:
+                        setattr(component, method_name, restore_value)
+                except Exception as e:
+                    logger.debug("Could not unwrap %s.%s during unload: %s", name, method_name, e)
+            self._block_pin_wrapped_methods = remaining
+
+    def restore_dropped_components(self, source: Any, device: torch.device | str | None = None) -> list[str]:
+        """Reload components dropped by :meth:`unload_text_encoders`, if possible.
+
+        Called before a managed generation so a second ``pipe(...)`` works after
+        an unload. Modular pipelines can rebuild a component from its
+        ``ComponentSpec`` via ``load_components(names=[...])``; a standard
+        ``DiffusionPipeline`` has no equivalent, so this raises rather than
+        letting diffusers fail later with a confusing ``NoneType`` error.
+
+        Pass *device* so the reloaded weights are re-hooked under the active
+        strategy; without it they are registered but left unplaced.
+
+        Returns the names restored (empty when there was nothing to do).
+        """
+        with self._lock:
+            pending = [name for name, sid in self._dropped_components.items() if sid == id(source)]
+        if not pending:
+            return []
+
+        loader = getattr(source, "load_components", None)
+        if not callable(loader):
+            raise RuntimeError(
+                f"{', '.join(pending)} was unloaded by unload_text_encoders() and "
+                f"{type(source).__name__} cannot reload it (no `load_components`). Rebuild the "
+                f"pipeline, or disable `unload_text_encoders` if you need more than one generation."
+            )
+        logger.info("Reloading unloaded component(s) %s before this generation.", pending)
+        loader(names=pending)
+
+        # Register the fresh modules directly: ``register_components`` is
+        # idempotent per source, so it would return early on a source it has
+        # already seen and leave the reloaded weights unmanaged and unhooked.
+        restored: list[str] = []
+        for name in pending:
+            module = getattr(source, name, None)
+            if not isinstance(module, nn.Module):
+                logger.warning("Reload of %s produced %s, not a module; leaving it unmanaged.", name, type(module))
+                continue
+            self.register_component(name, module)
+            with self._lock:
+                record = self._source_registrations.get(id(source))
+                if record is not None:
+                    record[name] = module
+                self._dropped_components.pop(name, None)
+            restored.append(name)
+
+        if restored and device is not None:
+            # Incremental: only the freshly-registered slots are processed.
+            self.apply_offload_strategy(device)
+        return restored
+
+    def _install_text_encoder_unload_hook(self, device: torch.device | str) -> None:
+        """Drop the text encoders once the first denoiser forward begins.
+
+        That moment is the natural boundary: prompt encoding is complete for the
+        whole generation, and not a single denoise activation has been allocated
+        yet, so the memory comes back exactly when the step is about to need it.
+        Reuses the same pre-forward-hook shape as the workload probe, but is
+        installed for every strategy rather than only ``block_pin``.
+        """
+        if not self._unload_text_encoders:
+            return
+        with self._lock:
+            for handle in self._text_encoder_unload_handles:
+                handle.remove()
+            self._text_encoder_unload_handles = []
+            components = dict(self._managed_components)
+        denoisers = [
+            components[c.name] for c in self.classify_components() if c.role == "denoiser" and c.name in components
+        ]
+        if not denoisers:
+            return
+
+        fired = {"done": False}
+
+        def _unload_hook(module, args):
+            if fired["done"]:
+                return
+            fired["done"] = True
+            # Do NOT remove hooks from inside the hook — the dict is mid-iteration.
+            try:
+                self.unload_text_encoders()
+            except Exception as e:  # never let this break a generation
+                logger.warning("Text-encoder unload failed: %s", e)
+
+        handles = [comp.register_forward_pre_hook(_unload_hook) for comp in denoisers]
+        with self._lock:
+            self._text_encoder_unload_handles = handles
+
     def _keep_resident_instead_of_offload(self, name: str, mod: Any, device: torch.device | str) -> bool:
         """Move *mod* fully onto *device* instead of group-offloading it, if it must be.
 
@@ -2740,6 +2979,10 @@ class ModelManager:
             # oversubscribes, instead of waiting for the whole (slow) generation.
             self._install_spill_calibration_hook(device_obj)
 
+        # Strategy-independent: the text encoders are dead weight once denoising
+        # starts no matter how the weights are placed.
+        self._install_text_encoder_unload_hook(device)
+
         with self._lock:
             for name, _ in unique:
                 self._component_strategies[name] = strategy
@@ -3058,6 +3301,8 @@ class ModelManager:
             self._block_pin_auto_evict = True
             self._block_pin_counts.clear()
             self._block_pin_user_counts.clear()
+            self._dropped_components.clear()
+            self._source_refs.clear()
             self._evict_on_neighbor.clear()
             self._block_pin_seq_len = 0
             self._block_pin_batch = 1
