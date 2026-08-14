@@ -5,79 +5,96 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-08-14
+
+### Added
+- **Model profiles**: `ModelProfile` and `register_model_profile`, a per-architecture
+  table keyed by pipeline class holding the two facts the resolver cannot read off the
+  module tree: denoiser concurrency and measured activation cost. Ships entries for the
+  Wan 2.2 family, Ideogram4, MiniMax-H3, LTX-2 and Krea 2.
+- **Call-time workload inference** (`ModelProfile.workload_fn`). The block_pin budget is
+  computed from each call's `height` / `width` / `num_frames` before the pipeline runs, so
+  `set_block_pin_workload` is no longer needed on a profiled architecture. Toggle with
+  `block_pin_call_workload=`.
+- **Bidirectional pin rebalancing**: the pin count can grow again, not only shrink, so a
+  small generation following a large one recovers the blocks the large one shed.
+- **`block_pin_workload_probe`** (default on) reads the real sequence length off the
+  denoiser's first input and lowers the pin count before any activation is allocated. Makes
+  `auto` safe on long video with nothing recorded by the caller.
+- **`unload_text_encoders`** (opt-in), with `unload_text_encoders()`,
+  `restore_dropped_components()` and `release_host_cache()` on `ModelManager`. Drops text
+  encoders by role once denoising starts and releases the pinned host pool, which `del` plus
+  `gc.collect()` does not: 44.3 GiB resident down to 7.9 on MiniMax-H3.
+- **Legacy `weight_norm` guard**: components using the deprecated `weight_g`/`weight_v`
+  spelling cannot be group offloaded, and are now kept resident with a warning instead of
+  failing on a CPU/CUDA mismatch. Hits diffusers audio autoencoders and vocoders.
+- `demo_scripts/measure_activation_slope.py` measures an architecture's activation slope
+  from `config.json` alone, with no checkpoint download.
+
+### Changed
+- Default activation slope raised 0.118 to 0.16 GiB/ktoken; every model measured sat above
+  the old value, LTX-2.3 (0.136) included. Expect slightly more conservative pin counts.
+- A **measured** slope now takes a 1.2x safety factor rather than 1.5x. Keeping 1.5x on top
+  of a measurement double-counts, badly enough to pin zero blocks on MiniMax-H3.
+- `denoiser_concurrency` defaults to `None`, meaning "use the pipeline's profile, else
+  `co_resident`". An explicit value still wins.
+- `block_pin` pins denoisers only; other components with an incidental block list fall back
+  to group offload instead of spending the pin budget.
+
+### Fixed
+- block_pin could pin more blocks than the workload left room for and OOM inside the first
+  transformer forward.
+- Auto-evict now releases the caching allocator's pool, so allocators outside PyTorch (cuDNN
+  workspaces, Triton scratch) can actually use the freed VRAM.
+
 ## [0.3.1] - 2026-07-20
 
 ### Fixed
-- `auto` no longer picks `model_offload` for pipelines with **two or more
-  co-resident denoisers** (e.g. Ideogram4 True-CFG's conditional +
-  unconditional transformers). `model_offload`'s accelerate chain holds only one
-  component on the GPU at a time, so it cannot co-reside them and would bulk-swap
-  a multi-GB DiT CPU↔GPU on every denoise step. The resolver now skips the
-  `model_offload` tier there and uses `block_pin` (or `group_offload` when there
-  is no block list). Only applies under `denoiser_concurrency="co_resident"`.
-- block_pin auto-resolution now targets the largest **block-bearing** component
-  instead of the largest component overall. Pipelines whose heaviest component
-  has no top-level block list (e.g. a text encoder marginally larger than each
-  transformer, or a denoiser whose blocks are nested rather than top-level) now
-  correctly resolve to `block_pin` and pin the denoiser's blocks, instead of
-  bailing to `group_offload`.
+- `auto` no longer picks `model_offload` for pipelines with two or more **co-resident
+  denoisers** (e.g. Ideogram4 True-CFG). The accelerate chain holds one component on the GPU
+  at a time, so it cannot co-reside them and would bulk-swap a multi-GB DiT every step; the
+  resolver now uses `block_pin`, or `group_offload` when there is no block list.
+- block_pin auto-resolution targets the largest **block-bearing** component rather than the
+  largest overall, so a pipeline whose heaviest component has no top-level block list still
+  resolves to `block_pin` and pins the denoiser.
 
 ## [0.3.0] - 2026-07-20
 
 ### Changed
-- **`auto` now prefers `block_pin` over `model_offload` when block_pin would fully
-  pin the largest component.** Same VRAM peak as `model_offload`, but the
-  transformer stays resident across runs instead of being re-cycled every
-  generation — strictly faster for repeated inference. ⚠️ **This changes which
-  strategy `auto` resolves to on some hardware/model combinations** (previously
-  `model_offload`, now `block_pin`). If you rely on a specific strategy, pass it
-  explicitly.
-- The `model_offload` auto tier now budgets against the **concurrent working set**
-  (all co-resident denoisers summed) instead of the single largest component, so
-  dual-DiT True-CFG pipelines no longer pick `model_offload` and then spill both
-  denoisers plus activations to RAM.
-- block_pin working-set headroom lowered to **2.0 GiB (Linux/macOS) / 3.0 GiB
-  (Windows)** — it is now safety headroom added *on top of* the workload-aware
-  activation estimate rather than the entire flat margin (was 6.5 / 8.5 GiB).
-- `managed()` now wraps the pipeline's `__call__` at the **type level** (via a
-  per-pipe dynamic subclass) instead of as an instance attribute, so the
-  device/dtype scope reliably applies to every `pipe(...)` call.
+- **`auto` now prefers `block_pin` over `model_offload` when block_pin would fully pin the
+  largest component**. Same VRAM peak, but the transformer stays resident across runs
+  instead of being re-cycled every generation. WARNING: this changes which strategy `auto`
+  resolves to on some hardware/model combinations. Pass one explicitly if you depend on it.
+- The `model_offload` tier budgets against the **concurrent working set** (co-resident
+  denoisers summed) rather than the largest single component, so dual-DiT True-CFG pipelines
+  no longer pick it and then spill both denoisers to RAM.
+- block_pin working-set headroom lowered to 2.0 GiB (Linux/macOS) and 3.0 GiB (Windows). It
+  is now headroom *on top of* the workload-aware activation estimate rather than the whole
+  flat margin (was 6.5 / 8.5 GiB).
+- `managed()` wraps `__call__` at the **type level** via a per-pipe dynamic subclass instead
+  of an instance attribute, so the device/dtype scope applies to every `pipe(...)` call.
 
 ### Added
-- **Workload-aware block_pin working set.** `ModelManager.set_block_pin_workload(seq_len, batch, *, activation_scale)`
-  records the denoise job so the reserved activation margin scales with it. The
-  new module-level `block_pin_activation_scale(lora_count=, image_cond=,
-  video_cond=, video_mode=)` helper (exported from `diffusers_mm`) computes the
-  `activation_scale` for LoRA / image / video conditioning. Activation-fit
-  constants are tunable via `auto_block_pin_act_*` ctor/`managed()` kwargs.
-- **Multi-denoiser budgeting.** Registered components are now classified by role
-  (denoiser / text_encoder / vae / other). The new `denoiser_concurrency`
-  ctor/`managed()` kwarg (`"co_resident"` default, or `"sequential"`) controls
-  whether multiple denoisers are budgeted as summed (both run every step —
-  Ideogram4 True-CFG) or as the largest single one (one active at a time —
-  Wan2.2 high/low-noise experts).
-- **Windows spill-aware block_pin recalibration** (`block_pin_spill_aware`,
-  default `True`; `block_pin_spill_margin_gb`, default `0.5`). After the first
-  denoise step (and again after each generation), if the caching allocator
-  reserved more than the card's VRAM (Windows sysmem fallback), pinned blocks are
-  unpinned until the workload fits — self-tuning the pin count to the real
-  activation footprint. No-op on Linux/macOS.
-- **Modular-pipeline support.** `group_offload` / `block_pin` now work on
-  diffusers experimental `ModularPipeline`s: `_execution_device` is patched to be
-  group-offload-aware so intermediates are created on the compute device instead
-  of CPU.
+- **Workload-aware block_pin working set**: `set_block_pin_workload(seq_len, batch, *,
+  activation_scale)` scales the reserved margin with the actual job, with the exported
+  `block_pin_activation_scale(...)` helper for LoRA / image / video conditioning and
+  `auto_block_pin_act_*` knobs.
+- **Multi-denoiser budgeting**: components are classified by role, and `denoiser_concurrency`
+  (`"co_resident"` / `"sequential"`) decides whether denoisers are summed or maxed.
+- **Windows spill-aware recalibration** (`block_pin_spill_aware`,
+  `block_pin_spill_margin_gb`) unpins blocks when the allocator reserves more than the
+  card's VRAM (sysmem fallback), self-tuning the pin count. No-op on Linux/macOS.
+- **Modular-pipeline support**: `_execution_device` is patched to be group-offload-aware, so
+  `group_offload` / `block_pin` no longer strand intermediates on the CPU.
 
 ### Fixed
-- block_pin auto-evict warm-up thrash: the runtime eviction check now uses
-  *effective* free VRAM (driver-free **plus** PyTorch's reclaimable
-  reserved-but-unallocated pool), so it no longer fires spuriously once the
-  allocator's pool warms up over the first few runs (~1.8× slowdown observed
-  previously on Klein 9B).
+- block_pin auto-evict warm-up thrash: the eviction check now uses *effective* free VRAM
+  (driver-free plus PyTorch's reclaimable reserved pool), so it stops firing spuriously once
+  the allocator's pool warms up (~1.8x slowdown seen on Klein 9B).
 
 ### Deprecated
-- `AUTO_NO_OFFLOAD_FACTOR` / `auto_no_offload_factor` — the `no_offload` auto tier
-  is now additive (`weights + working_set ≤ VRAM`) rather than a multiplier. The
-  constant is unused but retained for backward compatibility.
+- `AUTO_NO_OFFLOAD_FACTOR` / `auto_no_offload_factor`: the `no_offload` tier is additive now
+  (`weights + working_set <= VRAM`). Unused, retained for backward compatibility.
 
 ## [0.2.1] - 2026-05-27
 
@@ -87,7 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Windows free-RAM accounting now applies a ComfyUI-borrowed correction
-  (`max(psutil.available, physical_total − (committed − vram_in_use))`, via
+  (`max(psutil.available, physical_total - (committed - vram_in_use))`, via
   `GetPerformanceInfo`) so WDDM commit-charge inflation no longer makes the
   resolver under-report available host RAM.
 
@@ -95,8 +112,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - block_pin **cross-component auto-evict** (`block_pin_auto_evict`) with a
-  four-tier eviction policy (per-component override → no-states → runtime
-  free-VRAM check → runtime RAM-absorb check), including VAE `decode`/`encode`
+  four-tier eviction policy (per-component override, then no-states, then runtime
+  free-VRAM check, then runtime RAM-absorb check), including VAE `decode`/`encode`
   method wrapping so eviction triggers on the calls that bypass `__call__`.
 - `debug_vram_breakdown()` and `record_memory_history()` debugging helpers.
 
@@ -113,6 +130,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hash-keyed component cache and `remove_offload_hooks()` fix for diffusers'
   submodule hook-traversal bug.
 
+[0.4.0]: https://github.com/asomoza/diffusers-mm/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/asomoza/diffusers-mm/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/asomoza/diffusers-mm/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/asomoza/diffusers-mm/compare/v0.2.0...v0.2.1
