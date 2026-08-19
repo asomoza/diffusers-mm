@@ -68,6 +68,42 @@ _SCOPED_DTYPE: contextvars.ContextVar[torch.dtype | None] = contextvars.ContextV
 )
 
 
+def _is_rocm() -> bool:
+    """True when torch is a ROCm/HIP build rather than a CUDA one.
+
+    Both report themselves as ``"cuda"`` devices, so ``torch.version.hip``
+    is the only reliable discriminator. Wrapped because the attribute is
+    absent on some builds.
+    """
+    try:
+        return torch.version.hip is not None
+    except Exception:
+        return False
+
+
+def _allocator_conf() -> str:
+    """Return the caching-allocator config string torch will actually parse.
+
+    Mirrors torch's own precedence (``c10/cuda/CUDAAllocatorConfig.h``):
+    ``PYTORCH_CUDA_ALLOC_CONF`` first, then ``PYTORCH_HIP_ALLOC_CONF`` on
+    ROCm builds, then the unified ``PYTORCH_ALLOC_CONF``. Presence wins over
+    content there, so a var that is set but empty stops the fallback here
+    too. Reading only the CUDA-named var would miss a user who configured
+    the allocator through either of the other two.
+    """
+    import os
+
+    names = ["PYTORCH_CUDA_ALLOC_CONF"]
+    if _is_rocm():
+        names.append("PYTORCH_HIP_ALLOC_CONF")
+    names.append("PYTORCH_ALLOC_CONF")
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return ""
+
+
 def get_device() -> torch.device | None:
     """Return the device set by the nearest enclosing ``device_scope``."""
     return _SCOPED_DEVICE.get()
@@ -1972,7 +2008,13 @@ class ModelManager:
         try:
             mod.to(device)
         except Exception as e:
+            # ``.to()`` walks submodules in order and mutates as it goes, so a
+            # failure part-way (OOM, typically) leaves the component split
+            # across devices. Put it back on the CPU before returning: the
+            # caller's fallback path assumes a uniform placement, and holding
+            # half a component on the GPU after an OOM helps nobody.
             logger.warning("Failed to make %s resident despite legacy weight_norm: %s", name, e)
+            self._reset_component_to_cpu(name, mod)
             return False
         logger.warning(
             "%s uses legacy torch.nn.utils.weight_norm (at %r), which is incompatible with "
@@ -1982,6 +2024,58 @@ class ModelManager:
             wn,
             device,
             size_gb,
+        )
+        return True
+
+    @staticmethod
+    def _reset_component_to_cpu(name: str, mod: Any) -> bool:
+        """Best-effort: strip offload hooks from *mod*, move it to CPU, free the VRAM.
+
+        Used on the failure paths where a component was left half-moved. Never
+        raises; returns True only if the reset actually went through, since the
+        callers' fallbacks are only safe on a uniformly placed component.
+        """
+        try:
+            remove_offload_hooks(mod)
+            mod.to("cpu")
+        except Exception as e:
+            logger.warning("block_pin: could not reset %s to CPU after a failure: %s", name, e)
+            return False
+        with contextlib.suppress(Exception):
+            torch.cuda.empty_cache()
+        return True
+
+    def _rollback_pin_to_group_offload(self, name: str, mod: Any, offload_kwargs: dict[str, Any]) -> bool:
+        """Undo a partially applied block_pin on *mod* and group-offload it instead.
+
+        :func:`~diffusers_mm.block_pin.apply_block_pin` moves the non-block
+        parts and then each pinned block onto the GPU *before* hooking the
+        overflow blocks, so a failure part-way (OOM on one of those moves, on a
+        card that raises instead of spilling) leaves the component split across
+        devices with no hooks on the blocks that never got them. The next
+        forward then dies on a device mismatch, which reads as a bug in the
+        model rather than a budget that did not fit.
+
+        So reset the component and fall back to plain group offload, the same
+        degradation block_pin already applies to a component with no usable
+        block list. Slower than pinning, but it runs.
+
+        Returns True when the component ends up group-offloaded, so the caller
+        can register it as a neighbor.
+        """
+        from diffusers.hooks.group_offloading import apply_group_offloading
+
+        if not self._reset_component_to_cpu(name, mod):
+            return False
+        try:
+            apply_group_offloading(mod, **offload_kwargs)
+        except Exception as e:
+            logger.warning("block_pin: group_offload rollback failed for %s: %s", name, e)
+            return False
+        logger.warning(
+            "block_pin: %s could not be pinned, rolled back to group_offload for the whole "
+            "component. Expect it to run slower than a successful pin.",
+            name,
         )
         return True
 
@@ -2333,17 +2427,41 @@ class ModelManager:
         fragmentation eats into that budget and can turn it into an OOM.
         Logged as a one-time hint when the strategy is applied.
 
-        Windows is skipped — ``expandable_segments`` depends on the CUDA
+        Windows is skipped: ``expandable_segments`` depends on the CUDA
         virtual memory management API not exposed on the Windows driver,
         so the env var is a silent no-op there. The Windows working-set
         constant already accounts for the larger allocator overhead.
-        """
-        import os
 
+        ROCm is skipped too, but for the opposite reason: the flag *is*
+        honoured on HIP builds (torch reads the CUDA-named var first), and
+        it swaps ``hipMalloc`` for the HIP virtual-memory path. That path
+        has been reported to hard-fail on small allocations while the
+        driver still reports many GiB free, which is not the fragmentation
+        this flag exists to fix. Recommending it there can break a working
+        run, so the hint points at the budget knobs instead.
+        """
         if sys.platform == "win32":
             return
-        conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        if "expandable_segments:True" not in conf:
+        conf = _allocator_conf()
+        enabled = "expandable_segments:True" in conf
+        if _is_rocm():
+            if enabled:
+                logger.info(
+                    "block_pin: 'expandable_segments:True' is set on a ROCm build, where it routes "
+                    "allocation through the HIP virtual-memory path instead of hipMalloc. If this "
+                    "run raises an out-of-memory error on a small allocation while the message "
+                    "still reports several GiB free, unset it: that failure is not the "
+                    "fragmentation this flag addresses."
+                )
+            else:
+                logger.info(
+                    "block_pin: ROCm build, so 'expandable_segments:True' is not recommended. The "
+                    "pin budget assumes an allocator whose reserved pool tracks live bytes; if this "
+                    "run OOMs, raise auto_block_pin_allocator_inflation (try 1.25) and "
+                    "auto_block_pin_allocator_pool_overhead_gb (try 1.0) instead."
+                )
+            return
+        if not enabled:
             logger.warning(
                 "block_pin: PYTORCH_CUDA_ALLOC_CONF does not include "
                 "'expandable_segments:True'. Allocator fragmentation eats into "
@@ -3034,6 +3152,8 @@ class ModelManager:
                     new_pinned.append((name, mod, block_attr, applied_n))
                 except Exception as e:
                     logger.warning("block_pin: failed for %s: %s", name, e)
+                    if self._rollback_pin_to_group_offload(name, mod, offload_kwargs):
+                        new_neighbors.append((name, mod))
 
             self._install_block_pin_auto_evict(new_pinned, new_neighbors, device_obj)
             # Read the true sequence length off the denoiser's first input and

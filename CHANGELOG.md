@@ -20,6 +20,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the workload fit.
 
 ### Fixed
+- **A failed pin no longer strands a component across two devices.** `apply_block_pin`
+  moves the non-block parts and the pinned blocks onto the GPU before hooking the overflow
+  blocks, so a failure part-way (OOM on a card that raises instead of spilling) left the
+  front of the model resident with unhooked blocks on the CPU, and the next forward died on
+  a device mismatch that reads as a model bug. The component is now reset to the CPU and
+  rolled back to plain `group_offload`, the same degradation `block_pin` already applies to
+  a component with no usable block list. The legacy-`weight_norm` residency path got the
+  same reset for its own half-moved case.
+- **No `expandable_segments` recommendation on ROCm.** The hint fired on any non-Windows
+  build, but on HIP builds the flag is honoured (torch reads the CUDA-named variable first)
+  and swaps `hipMalloc` for the HIP virtual-memory path, which has been reported to
+  hard-fail on small allocations while the driver still reports many GiB free. That is not
+  the fragmentation the flag addresses, so following the hint can break a working run. ROCm
+  now gets a pointer to `auto_block_pin_allocator_inflation` /
+  `auto_block_pin_allocator_pool_overhead_gb` instead, plus a note to unset the flag if it
+  is already set.
+- **The allocator config is read the way torch reads it**: `PYTORCH_CUDA_ALLOC_CONF`, then
+  `PYTORCH_HIP_ALLOC_CONF` on ROCm, then the current unified `PYTORCH_ALLOC_CONF`. Users
+  who had configured `expandable_segments` through either of the latter two were told to
+  set it again.
 - **Log messages are ASCII-only.** `logging` encodes with the stream's encoding, so a
   non-ASCII character dropped the whole record on a legacy-code-page console — including
   every `block_pin` rebalance, workload-probe and spill-recalibration line.

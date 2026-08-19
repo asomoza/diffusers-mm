@@ -97,6 +97,16 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 Without it, allocator fragmentation can eat ~1-2 GiB and a careful budget can OOM. The strategy logs a warning if it's missing on apply.
 
+**ROCm: don't set it.** On HIP builds torch honours the flag (it reads `PYTORCH_CUDA_ALLOC_CONF` first, then `PYTORCH_HIP_ALLOC_CONF`, then `PYTORCH_ALLOC_CONF`), and it swaps `hipMalloc` for the HIP virtual-memory path. Setting it has been reported to turn a working run into an out-of-memory error on an allocation as small as 20 MiB *while the error message still reports 12 GiB free*, which is not the fragmentation the flag exists to fix. `block_pin` therefore never recommends it on ROCm. Compensate for the fixed-segment allocator with the reserved-pool knobs instead:
+
+```python
+pipe = managed(
+    pipe,
+    auto_block_pin_allocator_inflation=1.25,
+    auto_block_pin_allocator_pool_overhead_gb=1.0,
+)
+```
+
 **Windows: the reserved pool, not the live bytes.** `expandable_segments` is inert on Windows — torch parses the flag, warns `expandable_segments not supported on this platform`, and ignores it, because the CUDA virtual-memory API it needs isn't exposed by the Windows driver. The allocator therefore accumulates fixed segments, and its *reserved pool* settles above the peak *live* bytes a forward holds: partly by a fixed amount (streamed block weights it holds without reusing), partly in proportion to the activations. The pool is what competes with pinned blocks for driver pages, so on Windows the pin budget corrects for both before subtracting:
 
 ```python

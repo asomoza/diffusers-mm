@@ -2318,6 +2318,143 @@ class TestApplyBlockPinStrategy:
         assert called_with == [m]
 
 
+class TestBlockPinRollback:
+    """A pin that fails part-way must not leave a component split across devices.
+
+    ``apply_block_pin`` moves parts to the GPU before hooking the overflow
+    blocks, so an OOM in the middle used to leave half a transformer resident
+    with unhooked blocks on the CPU - a device mismatch on the next forward.
+    """
+
+    @staticmethod
+    def _blocky() -> nn.Module:
+        m = nn.Module()
+        m.head = nn.Linear(4, 4)
+        m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(5)])
+        return m
+
+    def test_pin_failure_rolls_back_to_group_offload(self, monkeypatch, caplog):
+        offloaded: list = []
+        monkeypatch.setattr(
+            "diffusers.hooks.group_offloading.apply_group_offloading",
+            lambda mod, **kwargs: offloaded.append(mod),
+        )
+        monkeypatch.setattr(
+            "diffusers_mm.manager.apply_block_pin",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("CUDA out of memory. Tried to allocate 250.00 MiB")),
+        )
+
+        mm = ModelManager(strategy="block_pin")
+        m = self._blocky()
+        mm.register_component("transformer", m)
+        mm.set_block_pin_count("transformer", 3)
+
+        with caplog.at_level(logging.INFO, logger="diffusers_mm.manager"):
+            mm.apply_offload_strategy("cpu")
+
+        # The whole component is group-offloaded exactly once (not per block),
+        # left on the CPU, and never recorded as having a pinned subset.
+        assert offloaded == [m]
+        assert all(p.device.type == "cpu" for p in m.parameters())
+        assert "transformer" not in mm._block_pin_states
+        # Specifically the rollback path, not the generic no-block-list fallback,
+        # and the component is registered as a neighbor so it gets evict wrappers.
+        assert "rolled back to group_offload" in caplog.text
+        assert "auto-evict installed (pinned=0, neighbors=1)" in caplog.text
+
+    def test_rollback_failure_leaves_no_pin_state(self, monkeypatch):
+        # Both the pin and the group_offload fallback fail: nothing to do but
+        # warn, and above all not claim a pinned subset that does not exist.
+        monkeypatch.setattr(
+            "diffusers.hooks.group_offloading.apply_group_offloading",
+            lambda mod, **kwargs: (_ for _ in ()).throw(RuntimeError("no")),
+        )
+        monkeypatch.setattr(
+            "diffusers_mm.manager.apply_block_pin",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("CUDA out of memory")),
+        )
+
+        mm = ModelManager(strategy="block_pin")
+        m = self._blocky()
+        mm.register_component("transformer", m)
+        mm.set_block_pin_count("transformer", 3)
+
+        mm.apply_offload_strategy("cpu")  # must not raise
+        assert mm._block_pin_states == {}
+
+    def test_failed_residency_move_returns_component_to_cpu(self, monkeypatch):
+        # The legacy-weight_norm path has the same half-moved hazard: `.to()`
+        # mutates submodules in order, so an OOM part-way strands some of them
+        # on the GPU.
+        m = nn.Module()
+        m.head = nn.Linear(4, 4)
+        reset: list = []
+        monkeypatch.setattr("diffusers_mm.manager.find_legacy_weight_norm", lambda mod: "head")
+        monkeypatch.setattr(
+            "diffusers_mm.manager.ModelManager._reset_component_to_cpu",
+            staticmethod(lambda name, mod: reset.append(name) or True),
+        )
+
+        mm = ModelManager(strategy="block_pin")
+
+        def boom(*a, **kw):
+            raise RuntimeError("CUDA out of memory. Tried to allocate 20.00 MiB")
+
+        monkeypatch.setattr(m, "to", boom)
+        assert mm._keep_resident_instead_of_offload("audio_vae", m, "cuda") is False
+        assert reset == ["audio_vae"]
+
+
+class TestExpandableSegmentsHint:
+    """The ``expandable_segments`` recommendation is platform-conditional."""
+
+    @staticmethod
+    def _linux(monkeypatch) -> None:
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_recommends_the_flag_on_a_cuda_build_when_unset(self, monkeypatch, caplog):
+        self._linux(monkeypatch)
+        monkeypatch.setattr("diffusers_mm.manager._is_rocm", lambda: False)
+        with caplog.at_level(logging.WARNING, logger="diffusers_mm.manager"):
+            ModelManager._maybe_warn_expandable_segments()
+        assert "expandable_segments:True" in caplog.text
+
+    def test_unified_alloc_conf_var_counts_as_set(self, monkeypatch, caplog):
+        # PYTORCH_ALLOC_CONF is torch's current name for the same setting;
+        # reading only the CUDA-named var warned users who had it configured.
+        self._linux(monkeypatch)
+        monkeypatch.setattr("diffusers_mm.manager._is_rocm", lambda: False)
+        monkeypatch.setenv("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+        with caplog.at_level(logging.WARNING, logger="diffusers_mm.manager"):
+            ModelManager._maybe_warn_expandable_segments()
+        assert caplog.text == ""
+
+    def test_rocm_is_never_told_to_set_the_flag(self, monkeypatch, caplog):
+        self._linux(monkeypatch)
+        monkeypatch.setattr("diffusers_mm.manager._is_rocm", lambda: True)
+        with caplog.at_level(logging.WARNING, logger="diffusers_mm.manager"):
+            ModelManager._maybe_warn_expandable_segments()
+        assert caplog.text == ""
+
+    def test_rocm_with_the_flag_set_gets_the_unset_it_hint(self, monkeypatch, caplog):
+        self._linux(monkeypatch)
+        monkeypatch.setattr("diffusers_mm.manager._is_rocm", lambda: True)
+        monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        with caplog.at_level(logging.INFO, logger="diffusers_mm.manager"):
+            ModelManager._maybe_warn_expandable_segments()
+        assert "ROCm build" in caplog.text
+        assert "unset it" in caplog.text
+
+    def test_windows_stays_silent(self, monkeypatch, caplog):
+        self._linux(monkeypatch)
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        with caplog.at_level(logging.WARNING, logger="diffusers_mm.manager"):
+            ModelManager._maybe_warn_expandable_segments()
+        assert caplog.text == ""
+
+
 class TestBlockPinTransition:
     """``prepare_strategy_transition`` must clean up block_pin's hooks
     on its way out, the same way it does for group_offload."""
