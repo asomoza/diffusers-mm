@@ -146,6 +146,12 @@ class ModelManager:
     # ``expandable_segments`` and so reserves more under the same load.
     AUTO_BLOCK_PIN_WORKING_SET_GB = offload_defaults.BLOCK_PIN_WORKING_SET_HEADROOM_GB
     AUTO_BLOCK_PIN_WORKING_SET_WINDOWS_GB = offload_defaults.BLOCK_PIN_WORKING_SET_HEADROOM_WINDOWS_GB
+    # VRAM withheld from every budget so the Windows sysmem fallback is never reached. See
+    # :meth:`_resolve_vram_reserve_gb`; zero off Windows, where the allocator raises instead of spilling.
+    VRAM_RESERVE_GB = offload_defaults.VRAM_RESERVE_GB
+    VRAM_RESERVE_WINDOWS_GB = offload_defaults.VRAM_RESERVE_WINDOWS_GB
+    VRAM_RESERVE_WINDOWS_LARGE_CARD_EXTRA_GB = offload_defaults.VRAM_RESERVE_WINDOWS_LARGE_CARD_EXTRA_GB
+    VRAM_RESERVE_LARGE_CARD_THRESHOLD_GB = offload_defaults.VRAM_RESERVE_LARGE_CARD_THRESHOLD_GB
     # Activation fit ``intercept + slope × ktokens``, where
     # ``ktokens = batch × seq_len / 1000`` from :meth:`set_block_pin_workload`,
     # so the reserve scales with video size / length instead of being flat. The
@@ -963,6 +969,23 @@ class ModelManager:
         except Exception:
             return 0
 
+    def _resolve_vram_reserve_gb(self, total_gb: float) -> float:
+        """VRAM withheld from the free reading, so no budget can reach the card's ceiling.
+
+        Windows serves allocations past the dedicated limit out of host RAM rather than raising, which never
+        fails and so never triggers any of the guards here — it just quietly takes the RAM the offloaded weights
+        were living in. The only way to not spill is to not get there, hence a reserve rather than a check.
+
+        Zero off Windows: the allocator raises there, which the existing degradation paths already handle.
+        """
+        if sys.platform != "win32":
+            return self.VRAM_RESERVE_GB
+
+        reserve = self.VRAM_RESERVE_WINDOWS_GB
+        if total_gb > self.VRAM_RESERVE_LARGE_CARD_THRESHOLD_GB:
+            reserve += self.VRAM_RESERVE_WINDOWS_LARGE_CARD_EXTRA_GB
+        return reserve
+
     def _detect_available_vram_gb(self, device: torch.device | str) -> tuple[float, float]:
         """Return ``(available_gb, total_gb)`` of VRAM on *device*.
 
@@ -970,13 +993,20 @@ class ModelManager:
         else is already allocated on the GPU — the CUDA context, other
         PyTorch tensors, other processes sharing the device. Returns
         ``(0.0, 0.0)`` on failure (non-CUDA, driver issue, etc.).
+
+        ``available_gb`` has :meth:`_resolve_vram_reserve_gb` already taken off it, so every budget downstream
+        inherits the reserve from one place. ``total_gb`` stays the true card size — the reserve limits what we
+        are willing to use, not what exists.
         """
         try:
             free_bytes, total_bytes = torch.cuda.mem_get_info(device)
-            return free_bytes / (1024**3), total_bytes / (1024**3)
         except Exception as e:
             logger.warning("auto: VRAM detection failed (%s)", e)
             return 0.0, 0.0
+
+        free_gb = free_bytes / (1024**3)
+        total_gb = total_bytes / (1024**3)
+        return max(0.0, free_gb - self._resolve_vram_reserve_gb(total_gb)), total_gb
 
     def _effective_free_vram_gb(self, device: torch.device | str) -> float:
         """Free VRAM the *workload* can actually use, in GB.

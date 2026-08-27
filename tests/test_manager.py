@@ -1967,8 +1967,10 @@ class TestBlockPinCount:
         # Windows carries a higher headroom plus the reserved-pool correction, so
         # it pins fewer blocks than Linux from the same inputs. Sized so both land
         # above zero and the arithmetic is under test rather than the clamp.
-        #   win32: 4.0 × 1.5 × 1.25 + 3.0 + 3.0 = 13.5 → 24 - 0.5 - 13.5 - 1 → 9
-        #   linux: 4.0 × 1.5              + 2.0 =  8.0 → 24 - 0.5 -  8.0 - 1 → 14
+        # Windows also has 0.7 GB withheld by the sysmem-fallback reserve (0.6, plus 0.1
+        # for a card above 15 GB), taken off the free reading before any of this.
+        #   win32: 4.0 × 1.5 × 1.25 + 3.0 + 3.0 = 13.5 → (24 - 0.7) - 0.5 - 13.5 - 1 → 8
+        #   linux: 4.0 × 1.5              + 2.0 =  8.0 →  24        - 0.5 -  8.0 - 1 → 14
         def count_on(platform):
             monkeypatch.setattr("diffusers_mm.manager.sys.platform", platform)
             _patch_vram(monkeypatch, 24.0)
@@ -1979,7 +1981,7 @@ class TestBlockPinCount:
             m.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(20)])
             return mm._compute_block_pin_count("transformer", m, "blocks", m.blocks, "cuda")
 
-        assert count_on("win32") == 9
+        assert count_on("win32") == 8
         assert count_on("linux") == 14
 
     def test_auto_count_shrinks_as_workload_grows(self, monkeypatch):
@@ -3934,3 +3936,62 @@ class TestUnloadTextEncoders:
             assert ref() is None
         finally:
             _logging.disable(_logging.NOTSET)
+
+
+class TestVramReserve:
+    """A fixed slice is withheld on Windows so no budget reaches the sysmem-fallback ceiling."""
+
+    def test_no_reserve_off_windows(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "linux")
+        _patch_vram(monkeypatch, 10.0, total_gib=24.0)
+        mm = ModelManager()
+        # The allocator raises on Linux, so the existing guards cover it and nothing is held back.
+        assert mm._detect_available_vram_gb("cuda") == pytest.approx((10.0, 24.0))
+
+    def test_windows_small_card(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        _patch_vram(monkeypatch, 6.0, total_gib=8.0)
+        mm = ModelManager()
+        avail, total = mm._detect_available_vram_gb("cuda")
+        assert avail == pytest.approx(6.0 - 0.6)
+        assert total == pytest.approx(8.0)  # the card's real size is reported unchanged
+
+    def test_windows_large_card_reserves_more(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        _patch_vram(monkeypatch, 14.0, total_gib=16.0)
+        mm = ModelManager()
+        avail, _ = mm._detect_available_vram_gb("cuda")
+        assert avail == pytest.approx(14.0 - 0.7)  # 0.6 + 0.1 above the 15 GB threshold
+
+    def test_threshold_is_on_total_not_free(self, monkeypatch):
+        # A 24 GB card with only 4 GB free is still a large card.
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        _patch_vram(monkeypatch, 4.0, total_gib=24.0)
+        mm = ModelManager()
+        avail, _ = mm._detect_available_vram_gb("cuda")
+        assert avail == pytest.approx(4.0 - 0.7)
+
+    def test_never_reports_negative(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        _patch_vram(monkeypatch, 0.2, total_gib=8.0)
+        mm = ModelManager()
+        avail, _ = mm._detect_available_vram_gb("cuda")
+        assert avail == 0.0  # clamped, not negative — callers treat <= 0 as "no room"
+
+    def test_reserve_is_overridable(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+        _patch_vram(monkeypatch, 6.0, total_gib=8.0)
+        mm = ModelManager()
+        mm.VRAM_RESERVE_WINDOWS_GB = 1.5
+        avail, _ = mm._detect_available_vram_gb("cuda")
+        assert avail == pytest.approx(4.5)
+
+    def test_detection_failure_still_returns_zeros(self, monkeypatch):
+        monkeypatch.setattr("diffusers_mm.manager.sys.platform", "win32")
+
+        def boom(device):
+            raise RuntimeError("no driver")
+
+        monkeypatch.setattr(torch.cuda, "mem_get_info", boom)
+        mm = ModelManager()
+        assert mm._detect_available_vram_gb("cuda") == (0.0, 0.0)

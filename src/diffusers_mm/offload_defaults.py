@@ -47,6 +47,21 @@ BLOCK_PIN_ALLOCATOR_POOL_OVERHEAD_WINDOWS_GB = 3.0
 BLOCK_PIN_WORKING_SET_HEADROOM_GB = 2.0
 BLOCK_PIN_WORKING_SET_HEADROOM_WINDOWS_GB = 3.0
 
+# --- VRAM held back from every budget ---------------------------------------
+# Windows in WDDM mode satisfies allocations past the dedicated limit out of host RAM instead of raising, so
+# nothing fails and every error-driven guard here stays unreachable — the run just gets slower as the borrowed
+# RAM stops holding the offloaded weights. Reaching the ceiling is the thing to avoid rather than to detect, so
+# a fixed slice is withheld from the free reading every budget derives from. Zero off Windows, where the
+# allocator raises and the existing guards handle it. ComfyUI reserves the same way for the same reason
+# (``model_management.py``: ``EXTRA_RESERVED_VRAM``, 600MB on Windows "because of the shared vram issue", plus
+# 100MB on cards above 15GB); these values follow theirs.
+VRAM_RESERVE_GB = 0.0
+VRAM_RESERVE_WINDOWS_GB = 0.6
+# Bigger cards get a bigger slice: the fallback is driven by the allocator's reserved pool, which scales with
+# the card rather than with the workload.
+VRAM_RESERVE_WINDOWS_LARGE_CARD_EXTRA_GB = 0.1
+VRAM_RESERVE_LARGE_CARD_THRESHOLD_GB = 15.0
+
 # --- conditioning / LoRA activation scaling ---------------------------------
 # Inflate the base activation estimate so block_pin pins fewer blocks up front
 # when the forward will allocate more than a plain text-to-X pass. They multiply
