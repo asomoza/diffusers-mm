@@ -312,6 +312,16 @@ with pipe.mm.record_memory_history("trace.pickle"):
 
 ## Development
 
+`torch` is declared unpinned, so `uv sync` resolves it from PyPI. That default is
+deliberate: pinning a CUDA index here would propagate to every project that depends
+on this library and collide with the index they chose. To develop against a specific
+CUDA build, install it into the environment yourself:
+
+```bash
+uv sync --extra dev --extra test
+uv pip install torch --index-url https://download.pytorch.org/whl/cu130
+```
+
 ```bash
 make format       # auto-format with ruff
 make lint-fix     # auto-fix lint issues
